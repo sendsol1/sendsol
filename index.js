@@ -1,7 +1,7 @@
 // Maximize libuv I/O threads — must be first line before any require
 process.env.UV_THREADPOOL_SIZE = '8';
 
-const cluster = require('cluster');
+const cluster = require('node:cluster');
 const https   = require('https');
 require('dotenv').config();
 
@@ -79,6 +79,7 @@ class SolanaWorkerMonitor {
         this.rpcFailedWallets  = new Set();
         // Connection pools — اتصالات WebSocket مشتركة بدل اتصال لكل محفظة
         this.solPool           = [];   // pool للـ SOL subscriptions
+        this.poolUrls          = [];   // روابط HTTP المقابلة لكل اتصال في الـ pool
         // روابط HTTP للـ snapshot (من RPC_URLS فقط — PublicNode للـ WSS فقط)
         this.snapshotRpcUrls   = [];
         this._snapRpcIdx       = 0;
@@ -629,16 +630,23 @@ class SolanaWorkerMonitor {
     // ── إضافة محافظ جديدة إلى مراقبة جارية بدون إيقاف الباقي ────────────────
     async appendWallets(newKeys, settings = {}) {
         // تحديث الإعدادات إن تغيرت
-        if (settings.mode)   this.mode   = settings.mode;
-        if (settings.chatId) this.chatId = settings.chatId;
+        if (settings.mode)    this.mode    = settings.mode;
+        if (settings.chatId)  this.chatId  = settings.chatId;
+        if (settings.network) this.network = settings.network;
+
+        // إذا لم يُستدعَ load() من قبل، نُهيئ allRpcUrls من المتغير العام
+        if (!this.allRpcUrls?.length) this.allRpcUrls = ALL_RPC_URLS;
 
         const monitorUrls = this.network === 'devnet'
             ? [DEVNET_HTTP]
-            : (this.snapshotRpcUrls?.length ? this.snapshotRpcUrls : this.allRpcUrls || []);
+            : (this.snapshotRpcUrls?.length ? this.snapshotRpcUrls
+                : (this.allRpcUrls?.length  ? this.allRpcUrls : ALL_RPC_URLS));
 
         const existing    = new Set(this.wallets.map(w => w.publicKey.toString()));
         const added       = [];
         const addedKeys   = []; // المفاتيح الخاصة المقابلة للمحافظ المضافة فعلاً
+        let   duplicates  = 0;
+        let   parseErrors = 0;
 
         for (const rawKey of newKeys) {
             const key = rawKey.trim();
@@ -650,7 +658,7 @@ class SolanaWorkerMonitor {
 
                 const wallet  = Keypair.fromSecretKey(secretKey);
                 const address = wallet.publicKey.toString();
-                if (existing.has(address)) continue;
+                if (existing.has(address)) { duplicates++; continue; }
 
                 const i = this.wallets.length;
 
@@ -676,13 +684,14 @@ class SolanaWorkerMonitor {
 
                 existing.add(address);
                 added.push(address);
-                addedKeys.push(key); // حفظ المفتاح الخاص المقابل
+                addedKeys.push(key);
 
                 // اشترك فوراً إذا كانت المراقبة تعمل
                 if (this.isMonitoring) this._subscribeSOL(i);
 
             } catch(e) {
-                this.notify(`❌ خطأ في إضافة المحفظة: ${e.message}`, 'error');
+                parseErrors++;
+                console.error(`[appendWallets] خطأ: ${e.message}`);
             }
         }
 
@@ -695,8 +704,7 @@ class SolanaWorkerMonitor {
         if (added.length)
             this.notify(`✅ أُضيفت ${added.length} محفظة جديدة (المجموع: ${this.wallets.length})`, 'success');
 
-        // نُعيد العناوين المضافة وكذلك المفاتيح الخاصة المقابلة لها
-        return { addresses: added, keys: addedKeys };
+        return { addresses: added, keys: addedKeys, duplicates, parseErrors };
     }
 }
 
@@ -1244,29 +1252,39 @@ if (cluster.isPrimary) {
 
         let addedCount    = 0;
         let addedKeysList = [];
+        let dupCount      = 0;
+        let parseErrCount = 0;
 
         if (targetProcess === 'primary') {
-            // أضف مباشرةً على primary
             const appendResult = await primaryMonitor.appendWallets(newKeys, settings);
             addedCount    = appendResult.addresses.length;
-            addedKeysList = appendResult.keys; // المفاتيح الخاصة المقبولة فعلاً
+            addedKeysList = appendResult.keys;
+            dupCount      = appendResult.duplicates  || 0;
+            parseErrCount = appendResult.parseErrors || 0;
             primaryState  = primaryMonitor.getState();
             if (!storedWalletSlices[0]) storedWalletSlices[0] = { keys: [], rpcs: [] };
             storedWalletSlices[0].keys.push(...addedKeysList);
         } else {
-            // أرسل للعامل المختار عبر askWorker
             const w      = orderedWorkers[targetProcess];
             const result = await askWorker(w, 'append-wallets', { keys: newKeys, settings });
-            addedCount    = result?.added ?? 0;
-            addedKeysList = result?.addedKeys ?? [];
-            // حدّث storedWalletSlices للعامل
+            addedCount    = result?.added        ?? 0;
+            addedKeysList = result?.addedKeys    ?? [];
+            dupCount      = result?.duplicates   ?? 0;
+            parseErrCount = result?.parseErrors  ?? 0;
             const sliceIdx = targetProcess + 1;
             if (!storedWalletSlices[sliceIdx]) storedWalletSlices[sliceIdx] = { keys: [], rpcs: [] };
             storedWalletSlices[sliceIdx].keys.push(...addedKeysList);
         }
 
         if (addedCount === 0) {
-            return res.json({ success: false, message: 'جميع المحافظ المُدخلة موجودة مسبقاً' });
+            let msg;
+            if (parseErrCount > 0 && dupCount === 0)
+                msg = `❌ المفاتيح المُدخلة غير صالحة (${parseErrCount} خطأ في التحليل)`;
+            else if (parseErrCount > 0)
+                msg = `⚠️ ${dupCount} مكررة، ${parseErrCount} غير صالحة — لم تُضَف أي محفظة جديدة`;
+            else
+                msg = 'جميع المحافظ المُدخلة موجودة مسبقاً في المراقبة';
+            return res.json({ success: false, message: msg });
         }
 
         addGlobalNotification(`✅ أُضيفت ${addedCount} محفظة جديدة | ${modeLabel}`, 'success');
@@ -1495,88 +1513,9 @@ if (cluster.isPrimary) {
         }
     });
 
-    // Build worker's Express app
-    const app = buildExpressApp(() => workerMonitor.getState());
-
-    app.post('/api/add-wallets', async (req, res) => {
-        const result = await ask('add-wallets', {
-            privateKeys: req.body.privateKeys || '',
-            settings:    req.body.settings    || {}
-        });
-        res.json(result);
-    });
-    app.post('/api/append-wallets', async (req, res) => {
-        const result = await ask('append-wallets', {
-            keys:     (req.body.keys || []),
-            settings: req.body.settings || {}
-        });
-        res.json(result || { success: false, message: 'timeout' });
-    });
-    app.post('/api/stop', async (req, res) => {
-        const result = await ask('stop');
-        res.json(result);
-    });
-    app.post('/api/resume', async (req, res) => {
-        const result = await ask('resume');
-        res.json(result);
-    });
-    app.post('/api/delete-wallet', async (req, res) => {
-        const result = await ask('delete-wallet', { address: req.body?.address || '' });
-        res.json(result || { success: false, message: 'timeout' });
-    });
-    app.get('/api/notifications', async (req, res) => {
-        const result = await ask('get-notifications');
-        res.json(Array.isArray(result) ? result : []);
-    });
-    app.get('/api/state', async (req, res) => {
-        const result = await ask('get-state');
-        res.json(result);
-    });
-    // ── SSE للعمال: IPC موحَّد واحد (get-updates) بدل طلبين منفصلين ──────────
-    app.get('/api/events', (req, res) => {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Accel-Buffering', 'no');
-        res.flushHeaders();
-        let active = true;
-        let lastId = null;
-        const tick = async () => {
-            if (!active || req.destroyed) return;
-            try {
-                const { state, notifs } = await ask('get-updates');
-                const headId = notifs?.[0]?.id;
-                if (headId !== lastId) {
-                    lastId = headId;
-                    res.write(`data: ${JSON.stringify({ t: 'u', state, notifs: notifs || [] })}\n\n`);
-                } else {
-                    res.write(`data: ${JSON.stringify({ t: 's', state })}\n\n`);
-                }
-            } catch(_) {}
-            if (active && !req.destroyed) setTimeout(tick, 800);
-        };
-        req.on('close', () => { active = false; });
-        tick();
-    });
-    app.get('/api/updates', async (_, res) => {
-        // طلب IPC واحد يجلب الحالة + الإشعارات معاً
-        const { state, notifs } = await ask('get-updates');
-        res.json({ state: state || {}, notifs: notifs || [] });
-    });
-    app.get('/api/status', async (req, res) => {
-        const result = await ask('get-state');
-        const wallets = (result.walletAddresses || []).map((w, i) => ({
-            index: i + 1, address: w.address, hasSubscription: w.active,
-            isFailed: w.isFailed, errorCount: w.errorCount
-        }));
-        res.json({ message: `📊 ${result.totalWallets || 0} محافظ | نشطة: ${result.totalActive || 0}`, wallets });
-    });
-
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`[WORKER PID:${process.pid}] HTTP on port ${PORT}`);
-        // أخبر الـ primary أن هذا العامل جاهز لاستقبال العمل
-        process.send({ cmd: 'worker-ready' });
-    });
+    // العمال يتواصلون مع الـ primary عبر IPC فقط — لا حاجة لـ HTTP server
+    console.log(`[WORKER PID:${process.pid}] جاهز (IPC فقط)`);
+    process.send({ cmd: 'worker-ready' });
 
     process.on('uncaughtException',  e => console.error(`[WORKER ${process.pid}] uncaughtException:`, e.message));
     process.on('unhandledRejection', r => console.error(`[WORKER ${process.pid}] unhandledRejection:`, r));

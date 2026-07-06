@@ -1,15 +1,22 @@
 {
-  "name": "solana-forwarder",
-  "version": "1.0.0",
-  "description": "Script for monitoring and forwarding SOL funds",
+  "name": "solana-wallet-monitor",
+  "version": "2.0.0",
+  "description": "مراقب محافظ Solana الموزّع مع دعم الـ Cluster و WebSocket",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "NODE_OPTIONS='--max-old-space-size=3072' node index.js",
+    "pm2": "pm2 start index.js --name solana-monitor --max-memory-restart 4G --node-args='--max-old-space-size=3072'"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.91.0",
+    "@solana/web3.js": "^1.98.0",
     "bs58": "^6.0.0",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "cluster": "^0.7.7",
+    "compression": "^1.7.4",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

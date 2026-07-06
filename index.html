@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>مراقب محافظ Solana</title>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#0a0f1e;min-height:100vh;color:#e2e8f0;direction:rtl}
+        .page{max-width:1100px;margin:0 auto;padding:16px}
+
+        /* ── Header ── */
+        .app-header{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;background:#111827;border-radius:14px;margin-bottom:14px;border:1px solid #1e2a42}
+        .app-header-title{font-size:1.45rem;font-weight:800;color:#f8fafc;text-align:center;flex:1}
+        .app-header-title span{color:#f97316}
+        .app-header-meta{text-align:left;font-size:11px;color:#64748b;min-width:130px}
+        .app-header-meta .meta-name{color:#94a3b8;font-weight:600;font-size:12px}
+        .gear-btn{width:40px;height:40px;border-radius:50%;border:1.5px solid #334155;background:#1e293b;color:#94a3b8;font-size:18px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;transition:all .2s;outline:none;flex-shrink:0}
+        .gear-btn:hover,.gear-btn.active{background:#334155;color:#f8fafc;border-color:#475569;transform:rotate(30deg)}
+
+        /* ── Layout ── */
+        .layout{display:grid;grid-template-columns:1fr 320px;gap:14px}
+        .left-col{display:flex;flex-direction:column;gap:14px}
+        .right-col{display:flex;flex-direction:column;gap:14px}
+
+        /* ── Cards ── */
+        .card{background:#111827;border:1px solid #1e2a42;border-radius:14px;padding:18px}
+        .card-title{font-size:1rem;font-weight:700;color:#f1f5f9;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between}
+
+        /* ── Stats grid ── */
+        .stats-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+        .stat-card{background:#0f172a;border:1px solid #1e2a42;border-radius:12px;padding:14px 16px;text-align:center}
+        .stat-card.accent{border-color:#1d4ed8}
+        .stat-icon{font-size:1.1rem;margin-bottom:4px}
+        .stat-value{font-size:1.7rem;font-weight:800;color:#f1f5f9;line-height:1.1}
+        .stat-value.green{color:#22c55e}
+        .stat-value.network{font-size:1.2rem;color:#22c55e;font-weight:800;letter-spacing:.05em}
+        .stat-value.red{color:#ef4444}
+        .stat-label{font-size:11px;color:#64748b;margin-top:4px}
+
+        /* ── Wallet Table ── */
+        .wallet-table-wrap{overflow-x:auto;margin-top:4px}
+        .wallet-table{width:100%;border-collapse:collapse;font-size:13px;direction:ltr}
+        .wallet-table th{padding:8px 10px;text-align:center;color:#94a3b8;font-weight:600;font-size:12px;border-bottom:1px solid #1e2a42;background:#0f172a;white-space:nowrap}
+        .wallet-table th.sortable{cursor:pointer;user-select:none;transition:color .15s}
+        .wallet-table th.sortable:hover{color:#f1f5f9}
+        .wallet-table th .sort-arrow{display:inline-block;margin-right:3px;opacity:.5;font-size:10px}
+        .wallet-table th.sorted .sort-arrow{opacity:1;color:#3b82f6}
+        .wallet-table td{padding:8px 10px;text-align:center;border-bottom:1px solid #0f172a;color:#cbd5e1}
+        .wallet-table tr:hover td{background:#0f1a2e}
+        .addr{font-family:monospace;font-size:12px;color:#7dd3fc;letter-spacing:.03em;cursor:pointer;user-select:none}
+        .addr:hover{color:#bae6fd;text-decoration:underline dotted}
+        .status-badge{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600}
+        .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
+        .dot.green{background:#22c55e;box-shadow:0 0 5px #22c55e88}
+        .dot.red{background:#ef4444;box-shadow:0 0 5px #ef444488}
+        .err-badge{background:#7f1d1d;color:#fca5a5;border-radius:6px;padding:1px 8px;font-size:11px;font-weight:700}
+        .err-badge.zero{background:#134e4a;color:#6ee7b7}
+        .del-btn{background:#1e2a42;border:1px solid #334155;color:#94a3b8;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:11px;transition:all .15s}
+        .del-btn:hover{background:#7f1d1d;border-color:#ef4444;color:#fca5a5}
+        .balance-val{font-family:monospace;font-size:12px;color:#a78bfa}
+        .no-wallets{text-align:center;color:#475569;padding:24px 0;font-size:13px}
+
+        /* ── Progress card ── */
+        .progress-card{background:#0f172a;border:1px solid #1d4ed8}
+        .progress-wrap{background:#1e2a42;border-radius:8px;overflow:hidden;height:14px;margin:10px 0}
+        .progress-fill{height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6);width:0%;transition:width .4s ease;border-radius:8px}
+        .progress-row{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#94a3b8}
+        .progress-pct{font-weight:700;color:#3b82f6}
+        #progressStatus{font-size:11px;color:#64748b;text-align:center;margin-top:4px}
+
+        /* ── Form ── */
+        .form-group{margin-bottom:12px}
+        label{display:block;margin-bottom:5px;font-weight:600;color:#94a3b8;font-size:12px}
+        textarea{width:100%;padding:12px;border:1.5px solid #1e2a42;border-radius:10px;font-size:12px;resize:vertical;min-height:90px;font-family:monospace;direction:ltr;text-align:left;background:#0f172a;color:#e2e8f0}
+        textarea:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.15)}
+        textarea::placeholder{color:#475569}
+        .file-input-wrap{position:relative}
+        #fileInput{width:100%;padding:9px 12px;border:1.5px dashed #1e2a42;border-radius:10px;font-size:12px;cursor:pointer;background:#0f172a;color:#94a3b8}
+        #fileInput:hover{border-color:#3b82f6}
+        #fileStatus{margin-top:6px;font-size:12px;color:#94a3b8;min-height:18px}
+        .key-preview{display:inline-block;background:#1e3a5f;border:1px solid #3b82f6;border-radius:5px;padding:2px 8px;font-size:11px;font-weight:700;color:#7dd3fc}
+
+        /* ── Buttons ── */
+        .btn{display:block;width:100%;padding:12px;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;transition:all .2s;font-family:inherit;text-align:center}
+        .btn-primary{background:linear-gradient(90deg,#3b82f6,#8b5cf6);color:#fff}
+        .btn-primary:hover{opacity:.9;transform:translateY(-1px)}
+        .btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none}
+        .btn-secondary{background:#1e2a42;color:#94a3b8;border:1px solid #334155}
+        .btn-secondary:hover{background:#334155;color:#f1f5f9}
+        .btn-danger{background:linear-gradient(90deg,#dc2626,#b91c1c);color:#fff}
+        .btn-danger:hover{opacity:.9}
+        .btn-success{background:linear-gradient(90deg,#16a34a,#15803d);color:#fff}
+        .btn-success:hover{opacity:.9}
+        .btn + .btn{margin-top:8px}
+
+        /* ── Notifications ── */
+        .notif-list{max-height:380px;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
+        .notif-item{padding:9px 12px;border-radius:9px;font-size:12px;border-right:3px solid #334155;background:#0f172a}
+        .notif-item.success{border-color:#22c55e;background:#052e16}
+        .notif-item.error{border-color:#ef4444;background:#2d0000}
+        .notif-item.warning{border-color:#f59e0b;background:#2d1a00}
+        .notif-item.info{border-color:#3b82f6;background:#0c1a2e}
+        .notif-msg{color:#e2e8f0;word-break:break-all;line-height:1.5}
+        .notif-time{font-size:10px;color:#475569;margin-top:3px}
+
+        /* ── Settings panel (popup) ── */
+        .settings-panel{display:none;position:fixed;top:70px;right:16px;width:270px;background:#111827;border:1px solid #1e2a42;border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,.6);z-index:9999;overflow:hidden}
+        .sp-header{background:linear-gradient(90deg,#1d4ed8,#7c3aed);color:#fff;padding:10px 14px;font-weight:700;font-size:13px}
+        .sp-body{padding:12px 14px}
+        .sp-section{margin-bottom:12px}
+        .sp-label{font-size:11px;font-weight:700;color:#64748b;margin-bottom:7px;text-transform:uppercase;letter-spacing:.05em}
+        .sp-row{display:flex;gap:6px}
+        .sp-opt{flex:1;padding:8px 6px;border:1.5px solid #1e2a42;border-radius:8px;cursor:pointer;text-align:center;font-weight:700;font-size:11px;background:#0f172a;color:#64748b;font-family:inherit;transition:all .15s}
+        .sp-opt:hover{border-color:#334155;color:#94a3b8}
+        .sp-opt.selected{border-color:#3b82f6!important;background:#1e3a5f!important;color:#7dd3fc!important}
+        .sp-input{width:100%;padding:8px;border:1.5px solid #1e2a42;border-radius:8px;font-size:12px;direction:ltr;box-sizing:border-box;margin-top:6px;background:#0f172a;color:#e2e8f0}
+        .sp-input:focus{outline:none;border-color:#3b82f6}
+        .sp-input::placeholder{color:#475569}
+        .sp-divider{height:1px;background:#1e2a42;margin:8px 0}
+        .sp-apply{width:100%;padding:9px;border:none;border-radius:8px;background:linear-gradient(90deg,#1d4ed8,#7c3aed);color:#fff;font-weight:700;font-size:12px;cursor:pointer;font-family:inherit;margin-top:4px}
+        .sp-apply:hover{opacity:.9}
+
+        /* ── Mode indicator ── */
+        #modeIndicator{display:none}
+
+        /* ── Control section ── */
+        .control-worker-label{font-size:11px;color:#64748b;margin-bottom:10px}
+
+        /* ── Toast ── */
+        .toast-notif{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(30px);min-width:240px;max-width:380px;padding:11px 18px;border-radius:10px;font-size:13px;font-weight:600;color:#fff;z-index:99999;opacity:0;transition:opacity .3s,transform .3s;box-shadow:0 6px 24px rgba(0,0,0,.5);text-align:center;pointer-events:none}
+        .toast-notif.show{opacity:1;transform:translateX(-50%) translateY(0)}
+        .toast-notif.info{background:#1d4ed8}
+        .toast-notif.success{background:#16a34a}
+        .toast-notif.error{background:#dc2626}
+        .toast-notif.warning{background:#d97706}
+
+        @media(max-width:768px){.layout{grid-template-columns:1fr}.stats-row{grid-template-columns:1fr 1fr}}
+    </style>
+</head>
+<body>
+<div class="page">
+
+    <!-- Header -->
+    <div class="app-header">
+        <button class="gear-btn" id="gearBtn" title="الإعدادات">⚙️</button>
+        <div class="app-header-title">🔥 مراقب محافظ <span>Solana</span></div>
+    </div>
+
+    <div class="layout">
+        <!-- Left column -->
+        <div class="left-col">
+
+            <!-- Stats -->
+            <div class="stats-row">
+                <div class="stat-card accent">
+                    <div class="stat-icon">💼</div>
+                    <div class="stat-value" id="walletCount">0</div>
+                    <div class="stat-label">المحافظ الكلية</div>
+                </div>
+                <div class="stat-card accent">
+                    <div class="stat-icon">🟢</div>
+                    <div class="stat-value green" id="activeCount">0</div>
+                    <div class="stat-label">المحفظة النشطة</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🌐</div>
+                    <div class="stat-value network" id="networkIndicator">MAINNET</div>
+                    <div class="stat-label">الشبكة</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🔴</div>
+                    <div class="stat-value red" id="errorCount">0</div>
+                    <div class="stat-label">الأخطاء</div>
+                </div>
+            </div>
+
+            <!-- Workers row -->
+            <div class="stats-row" style="grid-template-columns:1fr">
+                <div class="stat-card" style="display:flex;align-items:center;justify-content:space-between;padding:12px 18px">
+                    <div style="display:flex;align-items:center;gap:10px">
+                        <span style="font-size:1.1rem">⚙️</span>
+                        <div class="stat-label" style="margin:0">العمال النشطون</div>
+                    </div>
+                    <div class="stat-value" id="workerCount" style="font-size:1.5rem">0</div>
+                </div>
+            </div>
+
+            <!-- Progress card (hidden until loading) -->
+            <div id="loadingCard" class="card progress-card" style="display:none">
+                <div class="card-title" style="margin-bottom:8px">⏳ جاري تحميل المحافظ...</div>
+                <div class="progress-row">
+                    <span><span id="progressText">0</span> / <span id="progressTotal">0</span> محفظة</span>
+                    <span class="progress-pct" id="progressPct">0%</span>
+                </div>
+                <div class="progress-wrap"><div class="progress-fill" id="progressFill"></div></div>
+                <div id="progressStatus">جاري التهيئة...</div>
+            </div>
+
+            <!-- Wallet status table (collapsible) -->
+            <div class="card">
+                <div class="card-title">
+                    <span>📊 حالة المحافظ</span>
+                    <button type="button" class="btn btn-secondary" id="statusBtn" style="width:auto;padding:6px 14px;font-size:12px">
+                        ▼ عرض الحالة
+                    </button>
+                </div>
+                <div id="walletTableWrap" style="display:none">
+                    <div class="wallet-table-wrap">
+                        <table class="wallet-table" id="walletTable">
+                            <thead>
+                                <tr>
+                                    <th>Address</th>
+                                    <th class="sortable" id="balanceHeader">
+                                        <span class="sort-arrow" id="sortArrow">↕</span>Balance (SOL)
+                                    </th>
+                                    <th>Status</th>
+                                    <th>Errors</th>
+                                    <th>Delete</th>
+                                </tr>
+                            </thead>
+                            <tbody id="walletTableBody">
+                                <tr><td colspan="5" class="no-wallets">لا توجد محافظ محملة بعد</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Add wallets -->
+            <div class="card">
+                <div class="card-title">📝 إضافة محافظ</div>
+                <form id="addForm">
+                    <div class="form-group">
+                        <label>ادخل المفاتيح الخاصة هنا... (قبل مشغل سطر)</label>
+                        <textarea id="privateKeys" placeholder="ضع المفاتيح الخاصة هنا&#10;كل مفتاح في سطر منفصل"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>📁 رفع ملف .txt</label>
+                        <input type="file" id="fileInput" accept=".txt,text/plain">
+                        <div id="fileStatus">Status : ملف txt رفع ملف</div>
+                    </div>
+                    <button type="submit" class="btn btn-primary" id="addBtn">إضافة وبث المراقبة</button>
+                </form>
+            </div>
+
+            <!-- Control -->
+            <div class="card">
+                <div class="card-title">⚡ التحكم</div>
+                <div class="control-worker-label">عبيد المراقبة استئناف المراقبة</div>
+                <button type="button" class="btn btn-danger" id="toggleBtn">■ إيقاف المراقبة</button>
+                <button type="button" class="btn btn-success" id="resumeBtn" style="display:none">▶ استئناف المراقبة</button>
+            </div>
+
+        </div>
+
+        <!-- Right column: Live notifications -->
+        <div class="right-col">
+            <div class="card" style="flex:1">
+                <div class="card-title">🔔 الإشعارات المباشرة</div>
+                <div class="notif-list" id="notifications">
+                    <div class="notif-item info">
+                        <div class="notif-msg">مرحباً بك في مراقب محافظ Solana الموزّع!</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Settings panel (popup) -->
+<div id="settingsPanel" class="settings-panel">
+    <div class="sp-header">⚙️ الإعدادات</div>
+    <div class="sp-body">
+        <div class="sp-section">
+            <div class="sp-label">🔧 وضع التشغيل Mode</div>
+            <div class="sp-row">
+                <button type="button" id="btn-forward"  class="sp-opt" onclick="setMode('forward')">💸 Forward</button>
+                <button type="button" id="btn-telegram" class="sp-opt" onclick="setMode('telegram')">📨 Telegram</button>
+            </div>
+            <div id="chatGroup" style="display:none">
+                <div class="sp-label" style="margin-top:8px">🆔 Telegram Chat ID</div>
+                <input type="text" id="sp-chatId" placeholder="-100xxxxxxxxxx" class="sp-input"
+                       oninput="currentSettings.chatId=this.value.trim();saveSettings(currentSettings)">
+            </div>
+        </div>
+        <div class="sp-divider"></div>
+        <div class="sp-section">
+            <div class="sp-label">🌐 الشبكة Network</div>
+            <div class="sp-row">
+                <button type="button" id="btn-mainnet" class="sp-opt" onclick="setNetwork('mainnet')">🟠 Mainnet</button>
+                <button type="button" id="btn-devnet"  class="sp-opt" onclick="setNetwork('devnet')">🟣 Devnet</button>
+            </div>
+        </div>
+        <div class="sp-divider"></div>
+        <button type="button" id="applySettingsBtn" onclick="applyCurrentSettings()" class="sp-apply">⚡ حفظ وتطبيق الإعدادات</button>
+        <div style="font-size:10px;color:#475569;text-align:center;margin-top:5px">يُعيد تحميل المحافظ بالإعدادات الجديدة</div>
+    </div>
+</div>
+
+<!-- Hidden mode indicator (kept for JS compatibility) -->
+<div id="modeIndicator"></div>
+
+<script>
+// ── Toast ────────────────────────────────────────────────────────────────────
+let _toastQueue = [];
+function toast(msg, type) {
+    type = type || 'info';
+    const el = document.createElement('div');
+    el.className = 'toast-notif ' + type;
+    el.textContent = msg;
+    document.body.appendChild(el);
+    const offset = _toastQueue.length * 60;
+    el.style.bottom = (24 + offset) + 'px';
+    _toastQueue.push(el);
+    requestAnimationFrame(() => el.classList.add('show'));
+    const dur = type === 'error' ? 6000 : type === 'warning' ? 5000 : 4000;
+    setTimeout(() => {
+        el.classList.remove('show');
+        setTimeout(() => { el.remove(); _toastQueue = _toastQueue.filter(x => x !== el); }, 350);
+    }, dur);
+}
+
+// ── localStorage ─────────────────────────────────────────────────────────────
+const SK_KEYS     = 'solana_monitor_keys';
+const SK_STATE    = 'solana_monitor_state';
+const SK_CACHE    = 'solana_token_cache';
+const SK_SETTINGS = 'solana_monitor_settings';
+
+const saveKeys     = k => localStorage.setItem(SK_KEYS, k);
+const loadKeys     = () => localStorage.getItem(SK_KEYS) || '';
+const saveState    = v => localStorage.setItem(SK_STATE, v ? '1' : '0');
+const loadState    = () => localStorage.getItem(SK_STATE) === '1';
+const saveCache    = c => { try { localStorage.setItem(SK_CACHE, JSON.stringify(c)); } catch(_) {} };
+const loadCache    = () => { try { return JSON.parse(localStorage.getItem(SK_CACHE) || '{}'); } catch(_) { return {}; } };
+const saveSettings = s => { try { localStorage.setItem(SK_SETTINGS, JSON.stringify(s)); } catch(_) {} };
+const loadSettings = () => { try { return JSON.parse(localStorage.getItem(SK_SETTINGS) || '{}'); } catch(_) { return {}; } };
+
+// ── State ────────────────────────────────────────────────────────────────────
+let cachedState    = {};
+let cachedNotifs   = [];
+let sseActive      = false;
+let sseSource      = null;
+let isReconnecting = false;
+let isLoading      = false;
+let progressTimerId = null;
+
+// ── Wallet table sort state ───────────────────────────────────────────────────
+let sortByBalance = false; // false = default order, true = descending by balance
+
+// ── Settings ─────────────────────────────────────────────────────────────────
+let currentSettings = Object.assign({ mode: 'forward', network: 'mainnet', chatId: '' }, loadSettings());
+
+// ── Address abbreviation: first 4 + last 4 chars ─────────────────────────────
+function abbrAddr(addr) {
+    if (!addr || addr.length <= 10) return addr;
+    return addr.slice(0, 4) + '...' + addr.slice(-4);
+}
+
+async function copyAddr(address) {
+    try {
+        await navigator.clipboard.writeText(address);
+        toast('📋 تم نسخ العنوان', 'info');
+    } catch(_) {
+        // fallback for older browsers
+        const ta = document.createElement('textarea');
+        ta.value = address; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        document.execCommand('copy'); document.body.removeChild(ta);
+        toast('📋 تم نسخ العنوان', 'info');
+    }
+}
+
+// ── Format balance from lamports to SOL ──────────────────────────────────────
+function fmtSol(lamports) {
+    if (!lamports) return '0.0000';
+    return (lamports / 1e9).toFixed(4);
+}
+
+// ── Render wallet table ───────────────────────────────────────────────────────
+function renderWalletTable(wallets) {
+    const tbody = document.getElementById('walletTableBody');
+    if (!wallets || wallets.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="no-wallets">لا توجد محافظ محملة بعد</td></tr>';
+        return;
+    }
+
+    // Sort if needed (keep original reference for delete)
+    let rows = wallets.map((w, i) => ({ ...w, origIdx: i }));
+    if (sortByBalance) {
+        rows.sort((a, b) => (b.balance || 0) - (a.balance || 0));
+    }
+
+    // Column order: Address | Balance (SOL) | Status | Errors | Delete
+    tbody.innerHTML = rows.map(w => {
+        const isActive  = w.active && !w.isFailed;
+        const statusHtml = isActive
+            ? `<span class="status-badge"><span class="dot green"></span> نشط</span>`
+            : `<span class="status-badge"><span class="dot red"></span> متوقف</span>`;
+        const errClass = w.errorCount > 0 ? 'err-badge' : 'err-badge zero';
+        const balSol   = fmtSol(w.balance);
+        const addrEsc  = escapeHtml(w.address || '');
+        return `<tr>
+            <td><span class="addr" title="${addrEsc}" onclick="copyAddr('${addrEsc}')">${escapeHtml(abbrAddr(w.address || ''))}</span></td>
+            <td><span class="balance-val">${balSol}</span></td>
+            <td>${statusHtml}</td>
+            <td><span class="${errClass}">${w.errorCount || 0}</span></td>
+            <td><button class="del-btn" onclick="deleteWallet('${addrEsc}')" title="حذف المحفظة">🗑️</button></td>
+        </tr>`;
+    }).join('');
+}
+
+// ── Balance column sort toggle ────────────────────────────────────────────────
+document.getElementById('balanceHeader').addEventListener('click', () => {
+    sortByBalance = !sortByBalance;
+    const header = document.getElementById('balanceHeader');
+    const arrow  = document.getElementById('sortArrow');
+    if (sortByBalance) {
+        header.classList.add('sorted');
+        arrow.textContent = '↓';
+    } else {
+        header.classList.remove('sorted');
+        arrow.textContent = '↕';
+    }
+    renderWalletTable(cachedState.walletAddresses || []);
+});
+
+// ── Delete wallet ─────────────────────────────────────────────────────────────
+async function deleteWallet(address) {
+    if (!confirm(`حذف المحفظة ${abbrAddr(address)} من المراقبة؟\nسيتم قطع اشتراكاتها وحذف كاشها فوراً.`)) return;
+    try {
+        const r = await (await fetch('/api/delete-wallet', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ address })
+        })).json();
+        if (r.success) {
+            toast(`🗑️ ${r.message}`, 'info');
+            // حذف المفتاح الخاص المقابل من localStorage
+            if (r.removedKey) {
+                const stored = loadKeys();
+                const remaining = stored.split(/[\r\n]+/)
+                    .filter(k => k.trim() && k.trim() !== r.removedKey.trim());
+                saveKeys(remaining.join('\n'));
+            }
+            // تحديث فوري للجدول من الكاش الحالي
+            const updated = (cachedState.walletAddresses || [])
+                .filter(w => w.address !== address);
+            cachedState = { ...cachedState, walletAddresses: updated,
+                totalWallets: (cachedState.totalWallets || 1) - 1 };
+            renderWalletTable(updated);
+        } else {
+            toast('خطأ: ' + r.message, 'error');
+        }
+    } catch(e) {
+        toast('خطأ في الاتصال: ' + e.message, 'error');
+    }
+}
+
+// ── Extract private keys ──────────────────────────────────────────────────────
+function extractPrivateKeys(text) {
+    const BASE58  = /^[1-9A-HJ-NP-Za-km-z]{80,90}$/;
+    const JSON_ARR = /^\[[\d,\s]+\]$/;
+    const keys = [];
+    for (const line of text.split(/[\r\n]+/)) {
+        const t = line.trim();
+        if (!t) continue;
+        if (JSON_ARR.test(t)) { keys.push(t); continue; }
+        if (BASE58.test(t))   { keys.push(t); continue; }
+    }
+    return keys;
+}
+
+// ── applyUpdates ──────────────────────────────────────────────────────────────
+function applyUpdates(state, notifs) {
+    if (state) {
+        cachedState = state;
+        document.getElementById('walletCount').textContent  = state.totalWallets || 0;
+        document.getElementById('activeCount').textContent  = state.totalActive  || 0;
+        document.getElementById('workerCount').textContent  = state.workers      || 0;
+        document.getElementById('errorCount').textContent   = state.totalFailed  || 0;
+        renderWalletTable(state.walletAddresses || []);
+    }
+    if (notifs) {
+        cachedNotifs = notifs;
+        const visible = notifs.filter(n =>
+            !n.message?.startsWith('__PROGRESS__:') && !n.message?.startsWith('__DONE__:')
+        );
+        const el = document.getElementById('notifications');
+        el.innerHTML = visible.length
+            ? visible.map(n =>
+                `<div class="notif-item ${escapeHtml(n.type || 'info')}">` +
+                    `<div class="notif-msg">${escapeHtml(n.message)}</div>` +
+                    `<div class="notif-time">${new Date(n.timestamp).toLocaleString('ar-EG')}</div>` +
+                `</div>`
+              ).join('')
+            : '<div class="notif-item info"><div class="notif-msg">لا توجد إشعارات حالياً</div></div>';
+
+        if (isLoading) {
+            const total = parseInt(document.getElementById('progressTotal').textContent) || 0;
+            let maxDone = 0, isDone = false;
+            for (const n of notifs) {
+                if (n.message?.startsWith('__PROGRESS__:'))
+                    maxDone = Math.max(maxDone, parseInt(n.message.split(':')[1]) || 0);
+                if (n.message?.startsWith('__DONE__:')) { isDone = true; maxDone = total; }
+            }
+            if (total > 0) {
+                const pct = Math.min(100, Math.round(maxDone / total * 100));
+                document.getElementById('progressText').textContent = maxDone;
+                document.getElementById('progressFill').style.width = pct + '%';
+                document.getElementById('progressPct').textContent  = pct + '%';
+                if (isDone) {
+                    document.getElementById('progressStatus').textContent = '✅ اكتمل التحميل!';
+                    isLoading = false;
+                    if (progressTimerId) { clearInterval(progressTimerId); progressTimerId = null; }
+                    setTimeout(() => {
+                        document.getElementById('loadingCard').style.display = 'none';
+                        setUI(true); saveState(true);
+                    }, 2500);
+                } else if (maxDone > 0) {
+                    document.getElementById('progressStatus').textContent =
+                        `📸 snapshot: ${maxDone}/${total} — اشتراكات SOL جارية...`;
+                }
+            }
+        }
+    }
+}
+
+// ── Progress ─────────────────────────────────────────────────────────────────
+function startProgress(total) {
+    isLoading = true;
+    document.getElementById('loadingCard').style.display  = 'block';
+    document.getElementById('progressTotal').textContent  = total;
+    document.getElementById('progressText').textContent   = '0';
+    document.getElementById('progressFill').style.width   = '0%';
+    document.getElementById('progressPct').textContent    = '0%';
+    document.getElementById('progressStatus').textContent = 'جاري أخذ snapshot للمحافظ بشكل متوازٍ...';
+    if (progressTimerId) clearInterval(progressTimerId);
+    progressTimerId = setInterval(async () => {
+        if (sseActive || !isLoading) { clearInterval(progressTimerId); progressTimerId = null; return; }
+        try {
+            const r = await (await fetch('/api/updates')).json();
+            applyUpdates(r.state, r.notifs);
+        } catch(_) {}
+    }, 1500);
+}
+
+function stopProgress() {
+    isLoading = false;
+    if (progressTimerId) { clearInterval(progressTimerId); progressTimerId = null; }
+    document.getElementById('loadingCard').style.display = 'none';
+}
+
+// ── Network indicator ─────────────────────────────────────────────────────────
+function updateNetworkIndicator() {
+    const el = document.getElementById('networkIndicator');
+    if (el) el.textContent = currentSettings.network === 'devnet' ? 'DEVNET' : 'MAINNET';
+}
+
+// ── Mode indicator (stub for compatibility) ───────────────────────────────────
+function updateModeIndicator() { updateNetworkIndicator(); }
+
+function markBtn(id, active) {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('selected', active);
+}
+
+function setMode(mode) {
+    currentSettings.mode = mode;
+    saveSettings(currentSettings);
+    markBtn('btn-forward',  mode === 'forward');
+    markBtn('btn-telegram', mode === 'telegram');
+    document.getElementById('chatGroup').style.display = mode === 'telegram' ? 'block' : 'none';
+    updateModeIndicator();
+}
+
+function setNetwork(network) {
+    currentSettings.network = network;
+    saveSettings(currentSettings);
+    markBtn('btn-mainnet', network === 'mainnet');
+    markBtn('btn-devnet',  network === 'devnet');
+    updateNetworkIndicator();
+}
+
+// ── Gear button ───────────────────────────────────────────────────────────────
+document.getElementById('gearBtn').addEventListener('click', function(e) {
+    e.stopPropagation();
+    const panel = document.getElementById('settingsPanel');
+    const show  = panel.style.display !== 'block';
+    panel.style.display = show ? 'block' : 'none';
+    this.classList.toggle('active', show);
+});
+document.addEventListener('click', function(e) {
+    const panel = document.getElementById('settingsPanel');
+    if (panel.style.display !== 'block') return;
+    if (!e.target.closest('#settingsPanel, #gearBtn')) {
+        panel.style.display = 'none';
+        document.getElementById('gearBtn').classList.remove('active');
+    }
+});
+
+function initSettingsUI() {
+    const ci = document.getElementById('sp-chatId');
+    if (ci) ci.value = currentSettings.chatId;
+    setMode(currentSettings.mode);
+    setNetwork(currentSettings.network);
+    updateNetworkIndicator();
+}
+
+// ── Apply settings ────────────────────────────────────────────────────────────
+async function applyCurrentSettings() {
+    const keys = loadKeys();
+    if (!keys) { toast('لا توجد محافظ محفوظة. أضف المحافظ أولاً.', 'warning'); return; }
+    if (currentSettings.mode === 'telegram' && !currentSettings.chatId.trim()) {
+        toast('⚠️ الرجاء إدخال Telegram Chat ID قبل التطبيق.', 'warning'); return;
+    }
+    const btn = document.getElementById('applySettingsBtn');
+    btn.textContent = '⏳ جاري التطبيق...'; btn.disabled = true;
+    try {
+        const r = await sendWallets(keys);
+        if (r && r.success) {
+            if (r.loading) { startProgress(r.total); }
+            else { setUI(true); saveState(true); await loadNotifications(); }
+            toast('✅ ' + r.message, 'success');
+        } else if (r) { toast('خطأ: ' + r.message, 'error'); }
+    } catch(e) { toast('خطأ: ' + e.message, 'error'); }
+    finally { btn.textContent = '⚡ حفظ وتطبيق الإعدادات'; btn.disabled = false; }
+}
+
+function syncTokenCache() { /* stub */ }
+
+// ── setUI ─────────────────────────────────────────────────────────────────────
+function setUI(isMonitoring) {
+    const stopBtn   = document.getElementById('toggleBtn');
+    const resumeBtn = document.getElementById('resumeBtn');
+    if (isMonitoring) {
+        stopBtn.style.display   = 'block';
+        resumeBtn.style.display = 'none';
+    } else {
+        stopBtn.style.display   = 'none';
+        resumeBtn.style.display = 'block';
+    }
+}
+
+// ── SSE ───────────────────────────────────────────────────────────────────────
+function escapeHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                    .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+}
+
+function startSSE() {
+    if (typeof EventSource === 'undefined') { fallbackPoll(); return; }
+    if (isReconnecting) return;
+    isReconnecting = true;
+    if (sseSource) { try { sseSource.close(); } catch(_) {} sseSource = null; }
+    const src = new EventSource('/api/events');
+    sseSource = src;
+    src.onmessage = (e) => {
+        isReconnecting = false;
+        try {
+            const d = JSON.parse(e.data);
+            if (d.t === 'i' || d.t === 'u') {
+                applyUpdates(d.state, d.notifs);
+            } else if (d.t === 'n') {
+                const merged = d.n ? [d.n, ...cachedNotifs].slice(0, 100) : cachedNotifs;
+                applyUpdates(d.state || null, merged);
+            } else if (d.t === 's') {
+                applyUpdates(d.state, null);
+            }
+            if (!sseActive) {
+                sseActive = true;
+                if (progressTimerId) { clearInterval(progressTimerId); progressTimerId = null; }
+            }
+        } catch(_) {}
+    };
+    src.onerror = () => {
+        src.close(); sseSource = null; sseActive = false; isReconnecting = false;
+        setTimeout(fallbackPoll, 3000);
+    };
+}
+
+async function fallbackPoll() {
+    if (isReconnecting) return;
+    try {
+        const r = await (await fetch('/api/updates')).json();
+        applyUpdates(r.state, r.notifs);
+    } catch(_) {}
+    startSSE();
+}
+
+async function loadNotifications() {
+    if (sseActive && cachedNotifs.length > 0) { applyUpdates(null, cachedNotifs); return; }
+    try {
+        const r = await (await fetch('/api/updates')).json();
+        applyUpdates(r.state, r.notifs);
+    } catch(_) {}
+}
+
+async function updateStats() {
+    if (sseActive && cachedState.totalWallets !== undefined) { applyUpdates(cachedState, null); return; }
+    try {
+        const s = await (await fetch('/api/state')).json();
+        applyUpdates(s, null);
+    } catch(_) {}
+}
+
+// ── Send wallets to server ────────────────────────────────────────────────────
+async function sendWallets(keysStr) {
+    if (currentSettings.mode === 'telegram' && !currentSettings.chatId.trim()) {
+        return { success: false, message: '⚠️ الرجاء إدخال Telegram Chat ID في الإعدادات (⚙️)' };
+    }
+    const settings = { mode: currentSettings.mode, network: currentSettings.network, chatId: currentSettings.chatId };
+    return (await fetch('/api/add-wallets', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ privateKeys: keysStr, tokenCache: loadCache(), settings })
+    })).json();
+}
+
+// ── File upload ───────────────────────────────────────────────────────────────
+document.getElementById('fileInput').addEventListener('change', function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const status = document.getElementById('fileStatus');
+    status.textContent = '⏳ جاري قراءة الملف: ' + file.name;
+    const reader = new FileReader();
+    reader.onerror = () => { status.textContent = '❌ فشل قراءة الملف'; toast('فشل في قراءة الملف', 'error'); };
+    reader.onload = async function(ev) {
+        const keys = extractPrivateKeys(ev.target.result || '');
+        if (keys.length === 0) {
+            status.textContent = `⚠️ لا توجد مفاتيح صالحة في: ${file.name}`;
+            toast('لم يُعثر على مفاتيح صالحة — تأكد من التنسيق', 'warning'); return;
+        }
+        status.innerHTML = `✅ <strong>${file.name}</strong> <span class="key-preview">🔑 ${keys.length} مفتاح خاص</span>`;
+        const keysStr = keys.join('\n');
+        document.getElementById('privateKeys').value = keysStr;
+        e.target.value = '';
+        const btn = document.getElementById('addBtn');
+        btn.textContent = `⏳ جاري إرسال ${keys.length} مفتاح...`; btn.disabled = true;
+        try {
+            const r = await sendWallets(keysStr);
+            if (r && r.success) {
+                saveKeys(keysStr); saveState(false);
+                document.getElementById('privateKeys').value = '';
+                if (r.loading) { startProgress(r.total); }
+                else { setUI(true); saveState(true); await loadNotifications(); }
+                toast(r.message, 'success');
+            } else if (r) { toast('خطأ: ' + r.message, 'error'); }
+        } catch(err) { toast('خطأ في الاتصال: ' + err.message, 'error'); }
+        finally { btn.textContent = 'إضافة وبث المراقبة'; btn.disabled = false; }
+    };
+    reader.readAsText(file);
+});
+
+// ── Manual form submit — يُضيف إلى الموجودة بدون إيقاف المراقبة ──────────────
+document.getElementById('addForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const raw = document.getElementById('privateKeys').value;
+    if (!raw.trim()) { toast('الرجاء إدخال المفاتيح الخاصة', 'warning'); return; }
+    const newKeys = extractPrivateKeys(raw);
+    if (newKeys.length === 0) { toast('لم يُعثر على مفاتيح صالحة', 'warning'); return; }
+
+    // حدّد المفاتيح الجديدة فعلاً (غير الموجودة في localStorage)
+    const existingKeys = extractPrivateKeys(loadKeys());
+    const existingSet  = new Set(existingKeys);
+    const addedKeys    = newKeys.filter(k => !existingSet.has(k));
+
+    if (addedKeys.length === 0) {
+        toast('هذه المحافظ موجودة مسبقاً في المراقبة', 'warning');
+        document.getElementById('privateKeys').value = '';
+        return;
+    }
+
+    const settings = { mode: currentSettings.mode, network: currentSettings.network, chatId: currentSettings.chatId };
+    const btn = document.getElementById('addBtn');
+    btn.textContent = `⏳ إضافة ${addedKeys.length} مفتاح...`; btn.disabled = true;
+    try {
+        // /api/append-wallets — يُضيف فقط الجديدة إلى العملية الأخف دون restart
+        const r = await (await fetch('/api/append-wallets', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ keys: addedKeys, settings })
+        })).json();
+
+        if (r && r.success) {
+            // حفظ الكل (موجود + جديد) في localStorage
+            const mergedStr = [...existingKeys, ...addedKeys].join('\n');
+            saveKeys(mergedStr); saveState(false);
+            document.getElementById('privateKeys').value = '';
+            toast(r.message, 'success');
+        } else if (r) { toast('خطأ: ' + r.message, 'error'); }
+    } catch(err) { toast('خطأ: ' + err.message, 'error'); }
+    finally { btn.textContent = 'إضافة وبث المراقبة'; btn.disabled = false; }
+});
+
+// ── Status button — toggle table open/close ───────────────────────────────────
+let tableVisible = false;
+document.getElementById('statusBtn').addEventListener('click', async () => {
+    const btn  = document.getElementById('statusBtn');
+    const wrap = document.getElementById('walletTableWrap');
+    tableVisible = !tableVisible;
+    if (tableVisible) {
+        wrap.style.display = 'block';
+        btn.textContent = '▲ إخفاء الحالة';
+        // إذا عندنا بيانات محدَّثة من SSE — اعرض فوراً
+        if (sseActive && cachedState.walletAddresses?.length >= 0) {
+            renderWalletTable(cachedState.walletAddresses || []);
+        } else {
+            btn.disabled = true;
+            try {
+                const s = await (await fetch('/api/state')).json();
+                applyUpdates(s, null);
+            } catch(e) { toast('خطأ: ' + e.message, 'error'); }
+            finally { btn.disabled = false; btn.textContent = '▲ إخفاء الحالة'; }
+        }
+    } else {
+        wrap.style.display = 'none';
+        btn.textContent = '▼ عرض الحالة';
+    }
+});
+
+// ── Stop button ───────────────────────────────────────────────────────────────
+document.getElementById('toggleBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('toggleBtn');
+    if (!confirm('هل أنت متأكد من إيقاف مراقبة جميع المحافظ؟')) return;
+    btn.textContent = 'جاري الإيقاف...'; btn.disabled = true;
+    try {
+        const r = await (await fetch('/api/stop', { method: 'POST' })).json();
+        saveState(false); setUI(false); stopProgress();
+        await loadNotifications(); toast(r.message, 'info');
+    } catch(e) { toast('خطأ: ' + e.message, 'error'); }
+    finally { btn.disabled = false; btn.textContent = '■ إيقاف المراقبة'; }
+});
+
+// ── Resume button ─────────────────────────────────────────────────────────────
+document.getElementById('resumeBtn').addEventListener('click', async () => {
+    const keys = loadKeys();
+    if (!keys) { toast('لا توجد محافظ محفوظة. الرجاء إضافة محافظ أولاً.', 'warning'); return; }
+    const btn = document.getElementById('resumeBtn');
+    btn.textContent = 'جاري الاستئناف...'; btn.disabled = true;
+    try {
+        const r = await sendWallets(keys);
+        if (r && r.success) {
+            saveState(false);
+            if (r.loading) { startProgress(r.total); }
+            else { setUI(true); saveState(true); await loadNotifications(); }
+            toast(r.message, 'success');
+        } else if (r) { toast('خطأ: ' + r.message, 'error'); }
+    } catch(e) { toast('خطأ: ' + e.message, 'error'); }
+    finally { btn.disabled = false; btn.textContent = '▶ استئناف المراقبة'; }
+});
+
+// ── DOMContentLoaded ──────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', async () => {
+    initSettingsUI();
+    const keys = loadKeys();
+    const was  = loadState();
+    try {
+        const serverState = await (await fetch('/api/state')).json();
+        const actuallyMonitoring = serverState.isMonitoring && serverState.totalActive > 0;
+        setUI(actuallyMonitoring);
+        saveState(actuallyMonitoring);
+        if (keys && was && !actuallyMonitoring) {
+            try {
+                const numWorkers = serverState.numWorkers || 1;
+                if (numWorkers > 0 && (serverState.workersReady || 0) < numWorkers) {
+                    await new Promise(resolve => {
+                        const deadline = Date.now() + 8000;
+                        const check = async () => {
+                            try {
+                                const s = await (await fetch('/api/state')).json();
+                                if ((s.workersReady || 0) >= (s.numWorkers || 1) || Date.now() >= deadline) resolve();
+                                else setTimeout(check, 300);
+                            } catch(_) { resolve(); }
+                        };
+                        setTimeout(check, 300);
+                    });
+                }
+                const r = await sendWallets(keys);
+                if (r && r.success) {
+                    saveState(false);
+                    if (r.loading) { startProgress(r.total); }
+                    else { setUI(true); saveState(true); }
+                }
+            } catch(e) { console.error('Auto-restore:', e); }
+        }
+    } catch(e) { setUI(keys ? was : false); }
+    await loadNotifications();
+    startSSE();
+    setInterval(() => { if (!sseActive) fallbackPoll(); }, 15000);
+});
+</script>
+</body>
+</html>

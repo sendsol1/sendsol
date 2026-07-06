@@ -636,8 +636,9 @@ class SolanaWorkerMonitor {
             ? [DEVNET_HTTP]
             : (this.snapshotRpcUrls?.length ? this.snapshotRpcUrls : this.allRpcUrls || []);
 
-        const existing = new Set(this.wallets.map(w => w.publicKey.toString()));
-        const added    = [];
+        const existing    = new Set(this.wallets.map(w => w.publicKey.toString()));
+        const added       = [];
+        const addedKeys   = []; // المفاتيح الخاصة المقابلة للمحافظ المضافة فعلاً
 
         for (const rawKey of newKeys) {
             const key = rawKey.trim();
@@ -675,6 +676,7 @@ class SolanaWorkerMonitor {
 
                 existing.add(address);
                 added.push(address);
+                addedKeys.push(key); // حفظ المفتاح الخاص المقابل
 
                 // اشترك فوراً إذا كانت المراقبة تعمل
                 if (this.isMonitoring) this._subscribeSOL(i);
@@ -693,7 +695,8 @@ class SolanaWorkerMonitor {
         if (added.length)
             this.notify(`✅ أُضيفت ${added.length} محفظة جديدة (المجموع: ${this.wallets.length})`, 'success');
 
-        return added;
+        // نُعيد العناوين المضافة وكذلك المفاتيح الخاصة المقابلة لها
+        return { addresses: added, keys: addedKeys };
     }
 }
 
@@ -1033,19 +1036,22 @@ if (cluster.isPrimary) {
                     }
 
                     let appAdded = 0;
+                    let appAddedKeys = [];
                     if (tgt === 'primary') {
-                        const addedAddrs = await primaryMonitor.appendWallets(appendKeys, appendSettings);
-                        appAdded = addedAddrs.length;
+                        const res2 = await primaryMonitor.appendWallets(appendKeys, appendSettings);
+                        appAdded     = res2.addresses.length;
+                        appAddedKeys = res2.keys;
                         primaryState = primaryMonitor.getState();
                         if (!storedWalletSlices[0]) storedWalletSlices[0] = { keys: [], rpcs: [] };
-                        storedWalletSlices[0].keys.push(...appendKeys.slice(0, appAdded));
+                        storedWalletSlices[0].keys.push(...appAddedKeys);
                     } else {
                         const wt     = orderedWorkers[tgt];
                         const wRes2  = await askWorker(wt, 'append-wallets', { keys: appendKeys, settings: appendSettings });
                         appAdded     = wRes2?.added ?? 0;
+                        appAddedKeys = wRes2?.addedKeys ?? [];
                         const sIdx   = tgt + 1;
                         if (!storedWalletSlices[sIdx]) storedWalletSlices[sIdx] = { keys: [], rpcs: [] };
-                        storedWalletSlices[sIdx].keys.push(...appendKeys.slice(0, appAdded));
+                        storedWalletSlices[sIdx].keys.push(...appAddedKeys);
                     }
 
                     if (appAdded > 0) {
@@ -1056,7 +1062,8 @@ if (cluster.isPrimary) {
                     w.send({ cmd: 'response', reqId: msg.reqId, result: {
                         success: appAdded > 0,
                         message: appAdded > 0 ? `✅ أُضيفت ${appAdded} محفظة للمراقبة` : 'جميع المحافظ موجودة مسبقاً',
-                        addedCount: appAdded
+                        addedCount: appAdded,
+                        addedKeys: appAddedKeys
                     }});
                     break;
                 }
@@ -1235,28 +1242,27 @@ if (cluster.isPrimary) {
             if (count < minCount) { minCount = count; targetProcess = i; }
         }
 
-        let addedCount = 0;
+        let addedCount    = 0;
+        let addedKeysList = [];
 
         if (targetProcess === 'primary') {
             // أضف مباشرةً على primary
-            const addedAddrs = await primaryMonitor.appendWallets(newKeys, settings);
-            addedCount  = addedAddrs.length;
-            primaryState = primaryMonitor.getState();
-            // storedWalletSlices[0] — نُضيف فقط المفاتيح التي قبلها appendWallets
-            // appendWallets تُعيد العناوين بالترتيب ذاته الذي أضافتها
-            // نحتاج المفاتيح الأصلية المقابلة — نأخذ أول addedCount مفتاح من newKeys
-            // (appendWallets تتجاهل المكررة وتُبقي الترتيب)
+            const appendResult = await primaryMonitor.appendWallets(newKeys, settings);
+            addedCount    = appendResult.addresses.length;
+            addedKeysList = appendResult.keys; // المفاتيح الخاصة المقبولة فعلاً
+            primaryState  = primaryMonitor.getState();
             if (!storedWalletSlices[0]) storedWalletSlices[0] = { keys: [], rpcs: [] };
-            storedWalletSlices[0].keys.push(...newKeys.slice(0, addedCount));
+            storedWalletSlices[0].keys.push(...addedKeysList);
         } else {
             // أرسل للعامل المختار عبر askWorker
             const w      = orderedWorkers[targetProcess];
             const result = await askWorker(w, 'append-wallets', { keys: newKeys, settings });
-            addedCount   = result?.added ?? 0;
+            addedCount    = result?.added ?? 0;
+            addedKeysList = result?.addedKeys ?? [];
             // حدّث storedWalletSlices للعامل
             const sliceIdx = targetProcess + 1;
             if (!storedWalletSlices[sliceIdx]) storedWalletSlices[sliceIdx] = { keys: [], rpcs: [] };
-            storedWalletSlices[sliceIdx].keys.push(...newKeys.slice(0, addedCount));
+            storedWalletSlices[sliceIdx].keys.push(...addedKeysList);
         }
 
         if (addedCount === 0) {
@@ -1266,7 +1272,7 @@ if (cluster.isPrimary) {
         addGlobalNotification(`✅ أُضيفت ${addedCount} محفظة جديدة | ${modeLabel}`, 'success');
         await new Promise(r => setTimeout(r, 400));
         pushSSE({ t: 'u', state: getAggregatedState(), notifs: globalNotifications.slice(0, 50) });
-        res.json({ success: true, message: `✅ أُضيفت ${addedCount} محفظة للمراقبة`, addedCount });
+        res.json({ success: true, message: `✅ أُضيفت ${addedCount} محفظة للمراقبة`, addedCount, addedKeys: addedKeysList });
     });
 
     // ── تحديث الإعدادات على المراقبة الجارية دون إعادة تحميل المحافظ ──────────
@@ -1477,13 +1483,13 @@ if (cluster.isPrimary) {
             }
         }
         if (msg.cmd === 'append-wallets') {
-            const added = await workerMonitor.appendWallets(msg.keys || [], msg.settings || {});
+            const appendRes = await workerMonitor.appendWallets(msg.keys || [], msg.settings || {});
             sendStateUpdate();
             if (msg.reqId) {
                 process.send({
                     cmd:    'worker-response',
                     reqId:  msg.reqId,
-                    result: { added: added.length, addresses: added }
+                    result: { added: appendRes.addresses.length, addresses: appendRes.addresses, addedKeys: appendRes.keys }
                 });
             }
         }

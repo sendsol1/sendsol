@@ -760,32 +760,30 @@ document.getElementById('addForm').addEventListener('submit', async function(e) 
     const newKeys = extractPrivateKeys(raw);
     if (newKeys.length === 0) { toast('لم يُعثر على مفاتيح صالحة', 'warning'); return; }
 
-    // حدّد المفاتيح الجديدة فعلاً (غير الموجودة في localStorage)
-    const existingKeys = extractPrivateKeys(loadKeys());
-    const existingSet  = new Set(existingKeys);
-    const addedKeys    = newKeys.filter(k => !existingSet.has(k));
-
-    if (addedKeys.length === 0) {
-        toast('هذه المحافظ موجودة مسبقاً في المراقبة', 'warning');
-        document.getElementById('privateKeys').value = '';
-        return;
-    }
-
     const settings = { mode: currentSettings.mode, network: currentSettings.network, chatId: currentSettings.chatId };
     const btn = document.getElementById('addBtn');
-    btn.textContent = `⏳ إضافة ${addedKeys.length} مفتاح...`; btn.disabled = true;
+    btn.textContent = `⏳ إضافة ${newKeys.length} مفتاح...`; btn.disabled = true;
     try {
         // /api/append-wallets — يُضيف فقط الجديدة إلى العملية الأخف دون restart
+        // السيرفر هو من يتحقق من التكرار بشكل صحيح
         const r = await (await fetch('/api/append-wallets', {
             method:  'POST',
             headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify({ keys: addedKeys, settings })
+            body:    JSON.stringify({ keys: newKeys, settings })
         })).json();
 
         if (r && r.success) {
-            // حفظ الكل (موجود + جديد) في localStorage
-            const mergedStr = [...existingKeys, ...addedKeys].join('\n');
-            saveKeys(mergedStr); saveState(false);
+            // نستخدم المفاتيح المقبولة فعلاً من السيرفر لتحديث localStorage بدقة
+            const serverAddedKeys = r.addedKeys || [];
+            if (serverAddedKeys.length > 0) {
+                const existingKeys = extractPrivateKeys(loadKeys());
+                const existingSet  = new Set(existingKeys);
+                const trulyNew     = serverAddedKeys.filter(k => !existingSet.has(k));
+                if (trulyNew.length > 0) {
+                    saveKeys([...existingKeys, ...trulyNew].join('\n'));
+                }
+            }
+            saveState(false);
             document.getElementById('privateKeys').value = '';
             toast(r.message, 'success');
         } else if (r) { toast('خطأ: ' + r.message, 'error'); }

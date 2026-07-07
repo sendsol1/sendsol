@@ -458,7 +458,6 @@ document.getElementById('balanceHeader').addEventListener('click', () => {
 
 // ── Delete wallet ─────────────────────────────────────────────────────────────
 async function deleteWallet(address) {
-    if (!confirm(`حذف المحفظة ${abbrAddr(address)} من المراقبة؟\nسيتم قطع اشتراكاتها وحذف كاشها فوراً.`)) return;
     try {
         const r = await (await fetch('/api/delete-wallet', {
             method:  'POST',

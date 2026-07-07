@@ -326,10 +326,15 @@ class SolanaWorkerMonitor {
                         const oldBal = this.lastBalances[idx] || 0;
                         if (newBal > oldBal && newBal > 0) {
                             const received = newBal - oldBal;
+                            // ✅ تحديث الرصيد فوراً قبل الإرسال — يمنع race condition
+                            // إذا أطلق WebSocket نفس الـ callback مرتين (processed+confirmed)
+                            // سيرى الثاني oldBal = newBal فلن يُرسل مجدداً
+                            this.lastBalances[idx] = newBal;
                             this.notify(`💰 وصل ${(received / LAMPORTS_PER_SOL).toFixed(4)} SOL إلى ${label}`, 'success');
                             await this.forwardFunds(this.connections[idx], wallet, newBal, label, idx);
+                        } else {
+                            this.lastBalances[idx] = newBal;
                         }
-                        this.lastBalances[idx] = newBal;
                     } catch (e) { this.handleError(e, idx, label); }
                 },
                 'confirmed'
@@ -435,27 +440,34 @@ class SolanaWorkerMonitor {
         return bh;
     }
 
-    // استقصاء التأكيد عبر HTTP (RPCs المستخدم، دوران) — مكالمة واحدة كل 500ms
-    // expiry زمني: blockhash صالح ~150 slot × 400ms ≈ 60s
-    async _pollSignature(sig, expiresAt) {
-        const INTERVAL = 500;
-        while (Date.now() < expiresAt) {
-            try {
-                const conn   = this._nextHttpConn();
-                const res    = conn ? await conn.getSignatureStatuses([sig]) : null;
-                const status = res?.value?.[0];
-                if (status) {
-                    if (status.err) throw new Error(`TX رُفضت: ${JSON.stringify(status.err)}`);
-                    if (status.confirmationStatus === 'confirmed' ||
-                        status.confirmationStatus === 'finalized') return true;
-                }
-            } catch (e) {
-                if (e.message?.includes('رُفضت')) throw e;
-                // أخطاء شبكة مؤقتة — تجاهل وأعد المحاولة
-            }
-            await new Promise(r => setTimeout(r, INTERVAL));
-        }
-        return false;
+    // تأكيد TX عبر WebSocket (event-driven) — يسابق بين جميع broadcastConnections
+    // أسرع بكثير من استقصاء HTTP كل 500ms
+    async _confirmViaWs(sig, latest) {
+        const TIMEOUT_MS = 60_000; // حد أقصى 60s (عمر الـ blockhash)
+
+        // كل اتصال يشترك عبر WebSocket في sig — أول من يؤكد يفوز
+        const racePromises = this.broadcastConnections.map((conn, idx) =>
+            conn.confirmTransaction(
+                {
+                    signature:            sig,
+                    blockhash:            latest.blockhash,
+                    lastValidBlockHeight: latest.lastValidBlockHeight,
+                },
+                'confirmed'
+            ).then(res => {
+                if (res.value?.err)
+                    throw new Error(`TX رُفضت: ${JSON.stringify(res.value.err)}`);
+                console.log(`[CONFIRM] ✓ RPC#${idx + 1} أكدت أولاً`);
+                return true;
+            })
+        );
+
+        // timeout بجانب السباق — لا ننتظر أبداً أكثر من TIMEOUT_MS
+        const timeout = new Promise((_, rej) =>
+            setTimeout(() => rej(new Error('انتهت مهلة التأكيد')), TIMEOUT_MS)
+        );
+
+        return Promise.race([Promise.any(racePromises), timeout]);
     }
 
     // ── إرسال TX مع تأكيد حقيقي وإعادة محاولة عند انتهاء الـ blockhash ──────
@@ -473,30 +485,26 @@ class SolanaWorkerMonitor {
 
             // بث إلى كل RPCs بالتوازي (fire-and-forget)
             const totalRpcs = this.broadcastConnections.length;
+            // skipPreflight: false — يُحاكي TX قبل الإرسال ويرفضها فوراً إن كان الرصيد غير كافٍ
+            // بدل إرسالها للشبكة وانتظار الرفض (يوفر وقتاً ويمنع Custom:1 الغامض)
             this.broadcastConnections.forEach((c, idx) =>
-                c.sendRawTransaction(rawTx, { skipPreflight: true, maxRetries: 3 })
+                c.sendRawTransaction(rawTx, { skipPreflight: false, maxRetries: 3 })
                   .then(() => console.log(`[BROADCAST] ✓ RPC#${idx + 1}/${totalRpcs}`))
                   .catch(e  => console.warn(`[BROADCAST] ✗ RPC#${idx + 1}/${totalRpcs}: ${e.message}`))
             );
             console.log(`[BROADCAST] → ${totalRpcs} RPC | sig: ${sig.slice(0, 12)}…`);
 
             try {
-                const confirmed = await this._pollSignature(sig, expiresAt);
-                if (!confirmed) {
-                    if (attempt < maxAttempts) {
-                        console.warn(`[SEND] blockhash انتهت — إعادة المحاولة ${attempt + 1}/${maxAttempts} لـ ${label}`);
-                        this._bhCache.fetchedAt = 0;
-                        continue;
-                    }
-                    throw new Error('انتهت صلاحية الـ blockhash بعد جميع المحاولات');
-                }
+                // تأكيد عبر WebSocket — event-driven بدل استقصاء HTTP كل 500ms
+                await this._confirmViaWs(sig, latest);
                 return sig;
             } catch (confirmErr) {
                 const isExpired = confirmErr instanceof TransactionExpiredBlockheightExceededError ||
                                   confirmErr instanceof TransactionExpiredTimeoutError ||
                                   confirmErr.message?.includes('block height exceeded') ||
                                   confirmErr.message?.includes('BlockhashNotFound') ||
-                                  confirmErr.message?.includes('Blockhash not found');
+                                  confirmErr.message?.includes('Blockhash not found') ||
+                                  confirmErr.message?.includes('انتهت مهلة التأكيد');
                 if (isExpired && attempt < maxAttempts) {
                     console.warn(`[SEND] blockhash انتهت — إعادة المحاولة ${attempt + 1}/${maxAttempts} لـ ${label}`);
                     this._bhCache.fetchedAt = 0;

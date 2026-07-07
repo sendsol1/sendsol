@@ -532,7 +532,7 @@ class SolanaWorkerMonitor {
         console.error(`[MONITOR] RPC error ${label} (${this.rpcErrorCounts[idx]}/${MAX}):`, error.message);
     }
 
-    stop() {
+    stop(clearAll = false) {
         // ── أولاً: أوقف العلَم — يمنع onFail/retry callbacks من الاستيقاظ ──────
         // يجب أن يكون قبل إغلاق أي WebSocket لأن إغلاقه يُطلق حدث 'close'
         // الذي يُفعّل _watchPoolSlot › onFail — وهو يتحقق من isMonitoring أولاً
@@ -559,7 +559,16 @@ class SolanaWorkerMonitor {
         this.lastBalances    = [];
         this.rpcErrorCounts.fill(0);
         this.rpcFailedWallets.clear();
-        console.log(`[PID ${process.pid}] Monitoring stopped, pool connections closed`);
+
+        // ── عند حذف الكل: امسح بيانات المحافظ كذلك حتى لا تظهر كمراقَبة ──────
+        if (clearAll) {
+            this.wallets           = [];
+            this.connections       = [];
+            this.privateKeyStrings = [];
+            this.rpcErrorCounts    = [];
+        }
+
+        console.log(`[PID ${process.pid}] Monitoring stopped, pool connections closed${clearAll ? ' (all wallets cleared)' : ''}`);
     }
 
     async resume(walletSlice, rpcSlice, allRpcUrls) {
@@ -1340,10 +1349,15 @@ if (cluster.isPrimary) {
         // جمع كل المفاتيح الخاصة المحفوظة قبل الحذف
         const allKeys = storedWalletSlices.flatMap(s => s.keys || []);
 
-        // إيقاف Primary ثم جميع العمال
-        primaryMonitor.stop();
+        // إيقاف Primary ثم جميع العمال مع مسح بيانات المحافظ نهائياً
+        primaryMonitor.stop(true);
         primaryState = primaryMonitor.getState();
-        broadcastToWorkers({ cmd: 'stop-monitoring' });
+        broadcastToWorkers({ cmd: 'stop-monitoring', clearAll: true });
+
+        // مسح الحالة المؤقتة للعمال فوراً حتى لا تظهر محافظ قديمة في SSE
+        for (const [id, s] of workerStates) {
+            workerStates.set(id, { ...s, isMonitoring: false, walletCount: 0, activeCount: 0, failedCount: 0, walletAddresses: [] });
+        }
 
         // مسح شرائح التخزين حتى لا يُستأنف عند /api/resume
         storedWalletSlices.length = 0;
@@ -1464,7 +1478,7 @@ if (cluster.isPrimary) {
             sendStateUpdate();
         }
         if (msg.cmd === 'stop-monitoring') {
-            workerMonitor.stop();
+            workerMonitor.stop(!!msg.clearAll);
             sendStateUpdate();
         }
         if (msg.cmd === 'update-settings') {

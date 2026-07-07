@@ -28,7 +28,7 @@ const TG_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN || '';
 
 const PORT         = process.env.PORT || 5000;
 const TARGET_ADDR  = 'XX4k8NidriAUsGKTjAvYHonxcKJj99R859vMAAGSLQ9';
-const UPR_API_KEY  = 'u3481669-d782b8b7c4054e980cf4eea2';
+
 // Read RPC URLs from RPC_URLS env var (comma OR newline separated)
 const ALL_RPC_URLS = (process.env.RPC_URLS || '')
     // إزالة بادئة "RPC_URLS=" إذا أدخلها المستخدم بالخطأ مع القيمة
@@ -731,62 +731,6 @@ class SolanaWorkerMonitor {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  UptimeRobot — auto-register a monitor for this app
-// ─────────────────────────────────────────────────────────────────────────────
-function uprRequest(path, body) {
-    return new Promise((resolve) => {
-        const payload = JSON.stringify({ ...body, api_key: UPR_API_KEY, format: 'json' });
-        const req = https.request(
-            { hostname: 'api.uptimerobot.com', path: `/v2/${path}`, method: 'POST',
-              agent: httpsKeepAlive,
-              headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } },
-            (res) => {
-                let data = '';
-                res.on('data', c => data += c);
-                res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({}); } });
-            }
-        );
-        req.on('error', () => resolve({}));
-        req.write(payload);
-        req.end();
-    });
-}
-
-async function ensureUptimeMonitor() {
-    try {
-        const domain = process.env.REPLIT_DOMAINS ? process.env.REPLIT_DOMAINS.split(',')[0].trim() : null;
-        if (!domain) { console.log('[UPR] No REPLIT_DOMAINS, skipping UptimeRobot registration'); return; }
-
-        const appUrl = `https://${domain}/health`;
-
-        // Check existing monitors
-        const existing = await uprRequest('getMonitors', {});
-        if (existing.stat === 'ok' && existing.monitors) {
-            const found = existing.monitors.find(m => m.url && m.url.includes(domain));
-            if (found) {
-                console.log(`[UPR] Monitor already exists: "${found.friendly_name}" (status: ${found.status})`);
-                return;
-            }
-        }
-
-        // Create new monitor — ping every 5 minutes
-        const result = await uprRequest('newMonitor', {
-            friendly_name: 'Solana Wallet Monitor',
-            url:           appUrl,
-            type:          1,      // HTTP(s)
-            interval:      300     // 5 minutes in seconds
-        });
-
-        if (result.stat === 'ok') {
-            console.log(`[UPR] ✅ UptimeRobot monitor created: ${appUrl} (every 5 min)`);
-        } else {
-            console.log('[UPR] Monitor creation response:', JSON.stringify(result));
-        }
-    } catch (e) {
-        console.error('[UPR] Error:', e.message);
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Telegram helper
@@ -1391,6 +1335,26 @@ if (cluster.isPrimary) {
         res.json({ success: false, message: `المحفظة ${shortAddr} غير موجودة في قائمة المراقبة` });
     });
 
+    // ── حذف جميع المحافظ دفعةً واحدة — نفس آلية removeWallet لكل محفظة ─────────
+    app.post('/api/delete-all-wallets', async (req, res) => {
+        // جمع كل المفاتيح الخاصة المحفوظة قبل الحذف
+        const allKeys = storedWalletSlices.flatMap(s => s.keys || []);
+
+        // إيقاف Primary ثم جميع العمال
+        primaryMonitor.stop();
+        primaryState = primaryMonitor.getState();
+        broadcastToWorkers({ cmd: 'stop-monitoring' });
+
+        // مسح شرائح التخزين حتى لا يُستأنف عند /api/resume
+        storedWalletSlices.length = 0;
+
+        const count = allKeys.length;
+        addGlobalNotification(`🗑️ تم حذف جميع المحافظ (${count} محفظة) من المراقبة`, 'info');
+        pushSSE({ t: 'u', state: getAggregatedState(), notifs: globalNotifications.slice(0, 50) });
+
+        res.json({ success: true, message: `تم حذف ${count} محفظة`, removedKeys: allKeys, count });
+    });
+
     app.post('/api/resume', async (_, res) => {
         if (!storedWalletSlices.length || !storedWalletSlices[0].keys.length) {
             res.json({ success: false, message: 'لا توجد محافظ محفوظة' }); return;
@@ -1445,11 +1409,9 @@ if (cluster.isPrimary) {
         return msg;
     }
 
-    app.listen(PORT, '0.0.0.0', async () => {
+    app.listen(PORT, '0.0.0.0', () => {
         console.log(`[PRIMARY PID:${process.pid}] HTTP on port ${PORT} | UV_THREADPOOL=8 | max-old-space=3072`);
         console.log(`[PRIMARY] Forked ${NUM_EXTRA_WORKERS} extra HTTP worker(s)`);
-        // Register with UptimeRobot after server starts
-        await ensureUptimeMonitor();
     });
 
     process.on('uncaughtException',  e => console.error('[PRIMARY] uncaughtException:', e.message));

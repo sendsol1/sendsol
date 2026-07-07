@@ -206,6 +206,18 @@
                     </button>
                 </div>
                 <div id="walletTableWrap" style="display:none">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+                        <input id="walletSearch" type="text" placeholder="🔍 ابحث بالعنوان..." autocomplete="off"
+                            style="flex:1;background:#0f172a;color:#e2e8f0;border:1px solid #1e3a5f;border-radius:8px;padding:5px 12px;font-size:12px;outline:none;min-width:0"
+                            oninput="filterWalletTable()" onpaste="setTimeout(filterWalletTable,0)">
+                        <button type="button" id="clearSearchBtn" onclick="clearWalletSearch()" title="مسح البحث"
+                            style="display:none;background:#1e3a5f;color:#94a3b8;border:1px solid #1e3a5f;border-radius:8px;padding:5px 10px;font-size:12px;cursor:pointer">✕</button>
+                        <button type="button" id="deleteAllBtn" onclick="deleteAllWallets()"
+                            style="background:#7f1d1d;color:#fca5a5;border:1px solid #991b1b;border-radius:8px;padding:5px 14px;font-size:12px;cursor:pointer;font-weight:600;transition:background .15s"
+                            onmouseover="this.style.background='#991b1b'" onmouseout="this.style.background='#7f1d1d'">
+                            🗑️ حذف الكل
+                        </button>
+                    </div>
                     <div class="wallet-table-wrap">
                         <table class="wallet-table" id="walletTable">
                             <thead>
@@ -410,6 +422,25 @@ function renderWalletTable(wallets) {
     }).join('');
 }
 
+// ── Search / filter wallet table ─────────────────────────────────────────────
+function filterWalletTable() {
+    const q = (document.getElementById('walletSearch').value || '').trim().toLowerCase();
+    document.getElementById('clearSearchBtn').style.display = q ? 'block' : 'none';
+    const wallets = cachedState.walletAddresses || [];
+    const filtered = q ? wallets.filter(w => (w.address || '').toLowerCase().includes(q)) : wallets;
+    renderWalletTable(filtered);
+    if (q && filtered.length === 0) {
+        document.getElementById('walletTableBody').innerHTML =
+            '<tr><td colspan="5" class="no-wallets">لا توجد محفظة بهذا العنوان</td></tr>';
+    }
+}
+
+function clearWalletSearch() {
+    document.getElementById('walletSearch').value = '';
+    document.getElementById('clearSearchBtn').style.display = 'none';
+    renderWalletTable(cachedState.walletAddresses || []);
+}
+
 // ── Balance column sort toggle ────────────────────────────────────────────────
 document.getElementById('balanceHeader').addEventListener('click', () => {
     sortByBalance = !sortByBalance;
@@ -454,6 +485,36 @@ async function deleteWallet(address) {
         }
     } catch(e) {
         toast('خطأ في الاتصال: ' + e.message, 'error');
+    }
+}
+
+// ── Delete ALL wallets ────────────────────────────────────────────────────────
+async function deleteAllWallets() {
+    const total = (cachedState.walletAddresses || []).length;
+    if (total === 0) { toast('لا توجد محافظ لحذفها', 'warning'); return; }
+    if (!confirm(`حذف جميع المحافظ (${total} محفظة) من المراقبة؟\nسيتم قطع جميع الاشتراكات وحذفها من الذاكرة.`)) return;
+    const btn = document.getElementById('deleteAllBtn');
+    btn.disabled = true; btn.textContent = '⏳ جاري الحذف...';
+    try {
+        const r = await (await fetch('/api/delete-all-wallets', { method: 'POST' })).json();
+        if (r.success) {
+            // حذف جميع المفاتيح من localStorage — نفس آلية deleteWallet
+            if (r.removedKeys && r.removedKeys.length > 0) {
+                saveKeys('');
+                saveState(false);
+            }
+            // تحديث الكاش والجدول فوراً
+            cachedState = { ...cachedState, walletAddresses: [], totalWallets: 0, totalActive: 0 };
+            renderWalletTable([]);
+            setUI(false);
+            toast(`🗑️ ${r.message}`, 'info');
+        } else {
+            toast('خطأ: ' + r.message, 'error');
+        }
+    } catch(e) {
+        toast('خطأ في الاتصال: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false; btn.textContent = '🗑️ حذف الكل';
     }
 }
 
@@ -740,10 +801,10 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
         try {
             const r = await sendWallets(keysStr);
             if (r && r.success) {
-                saveKeys(keysStr); saveState(false);
+                saveKeys(keysStr); saveState(true);
                 document.getElementById('privateKeys').value = '';
                 if (r.loading) { startProgress(r.total); }
-                else { setUI(true); saveState(true); await loadNotifications(); }
+                else { setUI(true); await loadNotifications(); }
                 toast(r.message, 'success');
             } else if (r) { toast('خطأ: ' + r.message, 'error'); }
         } catch(err) { toast('خطأ في الاتصال: ' + err.message, 'error'); }
@@ -783,7 +844,7 @@ document.getElementById('addForm').addEventListener('submit', async function(e) 
                     saveKeys([...existingKeys, ...trulyNew].join('\n'));
                 }
             }
-            saveState(false);
+            saveState(true);
             document.getElementById('privateKeys').value = '';
             toast(r.message, 'success');
         } else if (r) { toast('خطأ: ' + r.message, 'error'); }
@@ -839,9 +900,9 @@ document.getElementById('resumeBtn').addEventListener('click', async () => {
     try {
         const r = await sendWallets(keys);
         if (r && r.success) {
-            saveState(false);
+            saveState(true);
             if (r.loading) { startProgress(r.total); }
-            else { setUI(true); saveState(true); await loadNotifications(); }
+            else { setUI(true); await loadNotifications(); }
             toast(r.message, 'success');
         } else if (r) { toast('خطأ: ' + r.message, 'error'); }
     } catch(e) { toast('خطأ: ' + e.message, 'error'); }
@@ -876,9 +937,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 }
                 const r = await sendWallets(keys);
                 if (r && r.success) {
-                    saveState(false);
+                    saveState(true);
                     if (r.loading) { startProgress(r.total); }
-                    else { setUI(true); saveState(true); }
+                    else { setUI(true); }
                 }
             } catch(e) { console.error('Auto-restore:', e); }
         }

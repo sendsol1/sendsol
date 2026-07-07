@@ -27,7 +27,7 @@ const DEVNET_WSS      = 'wss://api.devnet.solana.com';
 const TG_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN || '';
 
 const PORT         = process.env.PORT || 5000;
-const TARGET_ADDR  = 'XX4k8NidriAUsGKTjAvYHonxcKJj99R859vMAAGSLQ9';
+const TARGET_ADDR  = 'A9Lhx1NvQGixH3QiRoRLiJLvaSQNysae8fj5SCPuKgSe';
 
 // Read RPC URLs from RPC_URLS env var (comma OR newline separated)
 const ALL_RPC_URLS = (process.env.RPC_URLS || '')

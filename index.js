@@ -31,6 +31,8 @@ const TARGET_ADDR  = 'XX4k8NidriAUsGKTjAvYHonxcKJj99R859vMAAGSLQ9';
 const UPR_API_KEY  = 'u3481669-d782b8b7c4054e980cf4eea2';
 // Read RPC URLs from RPC_URLS env var (comma OR newline separated)
 const ALL_RPC_URLS = (process.env.RPC_URLS || '')
+    // إزالة بادئة "RPC_URLS=" إذا أدخلها المستخدم بالخطأ مع القيمة
+    .replace(/^\s*RPC_URLS\s*=\s*/i, '')
     .split(/[,\r\n\s]+/)
     .map(u => u.trim().replace(/^\uFEFF/, ''))
     .filter(u => /^https?:\/\//i.test(u));
@@ -636,6 +638,19 @@ class SolanaWorkerMonitor {
 
         // إذا لم يُستدعَ load() من قبل، نُهيئ allRpcUrls من المتغير العام
         if (!this.allRpcUrls?.length) this.allRpcUrls = ALL_RPC_URLS;
+
+        // تأكد أن broadcastConnections مهيَّأة وعلى الشبكة الصحيحة —
+        // قد تكون فارغة إذا أُضيفت المحافظ عبر appendWallets دون المرور بـ load()،
+        // أو تكون على شبكة قديمة إذا تغيّرت settings.network
+        const expectedBcPrefix = this.network === 'devnet' ? DEVNET_HTTP : null;
+        const bcStale = !this.broadcastConnections?.length ||
+            (this.network === 'devnet' && !this.broadcastConnections[0]?._rpcEndpoint?.startsWith(DEVNET_HTTP)) ||
+            (this.network !== 'devnet'  && this.broadcastConnections[0]?._rpcEndpoint?.startsWith(DEVNET_HTTP));
+        if (bcStale) {
+            const bcUrls = this.network === 'devnet' ? [DEVNET_HTTP] : this.allRpcUrls;
+            this.broadcastConnections = bcUrls.map(u => new Connection(u, 'confirmed'));
+            this._rpcIdx = 0;
+        }
 
         const monitorUrls = this.network === 'devnet'
             ? [DEVNET_HTTP]

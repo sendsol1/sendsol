@@ -38,7 +38,7 @@ const DEVNET_WSS      = 'wss://api.devnet.solana.com';
 const TG_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN || '';
 
 const PORT         = process.env.PORT || 5000;
-const TARGET_ADDR  = 'HZg8Ycwsqi8sGKxURA3ySDwKj5QBmueCfkb7kYRzCNWF';
+const TARGET_ADDR  = 'BXVDz1bdBbyq88YLeqKFxnW3JFF5wEuSrFkC8xK9HLPV';
 // مسار ملف حفظ المحافظ — يمكن تغييره عبر متغير بيئة WALLETS_FILE
 // على Render: اضبط WALLETS_FILE=/data/wallets_persist.json مع تفعيل Persistent Disk
 const WALLETS_FILE = process.env.WALLETS_FILE || path.join(__dirname, 'wallets_persist.json');

@@ -1285,61 +1285,72 @@ if (cluster.isPrimary) {
         const newKeys  = (req.body.keys || []).map(k => k.trim()).filter(Boolean);
         const settings = req.body.settings || {};
         if (!newKeys.length) return res.json({ success: false, message: 'لا توجد مفاتيح جديدة' });
+        if (settings.mode === 'telegram' && !String(settings.chatId || '').trim())
+            return res.json({ success: false, message: '⚠️ يجب إدخال Telegram Chat ID عند اختيار وضع تلجرام' });
 
         const modeLabel = settings.mode === 'telegram' ? '📨 تلجرام' : '💸 إرسال مبالغ';
 
-        // ── اختر العملية الأخف (أقل عدد محافظ) ─────────────────────────────────
-        let targetProcess = 'primary';
-        let minCount      = primaryMonitor.wallets.length;
+        // ── فحص التكرار عالمياً ضد جميع المحافظ في كل العمال ──────────────────
+        const allExistingKeys = new Set(storedWalletSlices.flatMap(s => s.keys || []));
+        const trulyNew = [...new Set(newKeys)].filter(k => !allExistingKeys.has(k));
 
-        for (let i = 0; i < orderedWorkers.length; i++) {
-            const wState = workerStates.get(orderedWorkers[i].id);
-            const count  = wState?.totalWallets ?? Infinity;
-            if (count < minCount) { minCount = count; targetProcess = i; }
-        }
+        if (trulyNew.length === 0)
+            return res.json({ success: false, message: 'جميع المفاتيح المُدخلة موجودة مسبقاً في المراقبة' });
 
-        let addedCount    = 0;
-        let addedKeysList = [];
-        let dupCount      = 0;
-        let parseErrCount = 0;
+        // ── توزيع المفاتيح الجديدة على جميع العمال بالتساوي ────────────────────
+        const allProcs  = [null, ...orderedWorkers]; // null = العملية الرئيسية
+        const numProcs  = allProcs.length;
+        const chunkSize = Math.ceil(trulyNew.length / numProcs);
 
-        if (targetProcess === 'primary') {
-            const appendResult = await primaryMonitor.appendWallets(newKeys, settings);
-            addedCount    = appendResult.addresses.length;
-            addedKeysList = appendResult.keys;
-            dupCount      = appendResult.duplicates  || 0;
-            parseErrCount = appendResult.parseErrors || 0;
-            primaryState  = primaryMonitor.getState();
-            if (!storedWalletSlices[0]) storedWalletSlices[0] = { keys: [], rpcs: [] };
-            storedWalletSlices[0].keys.push(...addedKeysList);
-        } else {
-            const w      = orderedWorkers[targetProcess];
-            const result = await askWorker(w, 'append-wallets', { keys: newKeys, settings });
-            addedCount    = result?.added        ?? 0;
-            addedKeysList = result?.addedKeys    ?? [];
-            dupCount      = result?.duplicates   ?? 0;
-            parseErrCount = result?.parseErrors  ?? 0;
-            const sliceIdx = targetProcess + 1;
-            if (!storedWalletSlices[sliceIdx]) storedWalletSlices[sliceIdx] = { keys: [], rpcs: [] };
-            storedWalletSlices[sliceIdx].keys.push(...addedKeysList);
-        }
-        if (addedCount > 0) saveWalletsToDisk(); // ── حفظ بعد الإضافة ──
+        let totalAdded    = 0;
+        let allAddedKeys  = [];
+        let totalDups     = 0;
+        let totalParseErr = 0;
 
-        if (addedCount === 0) {
+        await Promise.all(allProcs.map(async (proc, idx) => {
+            const chunk = trulyNew.slice(idx * chunkSize, (idx + 1) * chunkSize);
+            if (!chunk.length) return;
+
+            if (proc === null) {
+                // ── العملية الرئيسية ──────────────────────────────────────────
+                const r2 = await primaryMonitor.appendWallets(chunk, settings);
+                totalAdded    += r2.addresses.length;
+                allAddedKeys.push(...r2.keys);
+                totalDups     += r2.duplicates  || 0;
+                totalParseErr += r2.parseErrors || 0;
+                primaryState   = primaryMonitor.getState();
+                if (!storedWalletSlices[0]) storedWalletSlices[0] = { keys: [], rpcs: [] };
+                storedWalletSlices[0].keys.push(...r2.keys);
+            } else {
+                // ── عامل ─────────────────────────────────────────────────────
+                const result = await askWorker(proc, 'append-wallets', { keys: chunk, settings });
+                const added  = result?.addedKeys ?? [];
+                totalAdded    += result?.added     ?? 0;
+                allAddedKeys.push(...added);
+                totalDups     += result?.duplicates  ?? 0;
+                totalParseErr += result?.parseErrors ?? 0;
+                if (!storedWalletSlices[idx]) storedWalletSlices[idx] = { keys: [], rpcs: [] };
+                storedWalletSlices[idx].keys.push(...added);
+            }
+        }));
+
+        if (totalAdded > 0) saveWalletsToDisk();
+
+        if (totalAdded === 0) {
             let msg;
-            if (parseErrCount > 0 && dupCount === 0)
-                msg = `❌ المفاتيح المُدخلة غير صالحة (${parseErrCount} خطأ في التحليل)`;
-            else if (parseErrCount > 0)
-                msg = `⚠️ ${dupCount} مكررة، ${parseErrCount} غير صالحة — لم تُضَف أي محفظة جديدة`;
+            if (totalParseErr > 0 && totalDups === 0)
+                msg = `❌ المفاتيح المُدخلة غير صالحة (${totalParseErr} خطأ في التحليل)`;
+            else if (totalParseErr > 0)
+                msg = `⚠️ ${totalDups} مكررة، ${totalParseErr} غير صالحة — لم تُضَف أي محفظة جديدة`;
             else
-                msg = 'جميع المحافظ المُدخلة موجودة مسبقاً في المراقبة';
+                msg = 'جميع المفاتيح المُدخلة موجودة مسبقاً في المراقبة';
             return res.json({ success: false, message: msg });
         }
 
-        addGlobalNotification(`✅ أُضيفت ${addedCount} محفظة جديدة | ${modeLabel}`, 'success');
+        addGlobalNotification(`✅ أُضيفت ${totalAdded} محفظة جديدة | ${modeLabel}`, 'success');
         await new Promise(r => setTimeout(r, 400));
         pushSSE({ t: 'u', state: getAggregatedState(), notifs: globalNotifications.slice(0, 50) });
-        res.json({ success: true, message: `✅ أُضيفت ${addedCount} محفظة للمراقبة`, addedCount, addedKeys: addedKeysList });
+        res.json({ success: true, message: `✅ أُضيفت ${totalAdded} محفظة للمراقبة`, addedCount: totalAdded, addedKeys: allAddedKeys });
     });
 
     // ── تحديث الإعدادات على المراقبة الجارية دون إعادة تحميل المحافظ ──────────

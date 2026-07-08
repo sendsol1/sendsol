@@ -1140,26 +1140,44 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
     const reader = new FileReader();
     reader.onerror = () => { status.textContent = '❌ فشل قراءة الملف'; toast('فشل في قراءة الملف', 'error'); };
     reader.onload = async function(ev) {
-        // استخراج المفاتيح وإزالة التكرار فوراً — نفس المصدر للسيرفر ولـ localStorage
-        const keys = [...new Set(extractPrivateKeys(ev.target.result || ''))];
-        if (keys.length === 0) {
+        // استخراج المفاتيح وإزالة التكرار الداخلي من الملف
+        const fileKeys = [...new Set(extractPrivateKeys(ev.target.result || ''))];
+        if (fileKeys.length === 0) {
             status.textContent = `⚠️ لا توجد مفاتيح صالحة في: ${file.name}`;
             toast('لم يُعثر على مفاتيح صالحة — تأكد من التنسيق', 'warning'); return;
         }
-        status.innerHTML = `✅ <strong>${file.name}</strong> <span class="key-preview">🔑 ${keys.length} مفتاح خاص</span>`;
-        const keysStr = keys.join('\n');
-        document.getElementById('privateKeys').value = keysStr;
+        status.innerHTML = `✅ <strong>${file.name}</strong> <span class="key-preview">🔑 ${fileKeys.length} مفتاح خاص</span>`;
+        document.getElementById('privateKeys').value = fileKeys.join('\n');
         e.target.value = '';
         const btn = document.getElementById('addBtn');
-        btn.textContent = `⏳ جاري إرسال ${keys.length} مفتاح...`; btn.disabled = true;
+        btn.textContent = `⏳ إضافة ${fileKeys.length} مفتاح...`; btn.disabled = true;
+
+        const settings = { mode: currentSettings.mode, network: currentSettings.network, chatId: currentSettings.chatId };
+        if (settings.mode === 'telegram' && !settings.chatId?.trim()) {
+            toast('⚠️ الرجاء إدخال Telegram Chat ID في الإعدادات (⚙️)', 'warning');
+            btn.disabled = false; btn.textContent = 'إضافة وبث المراقبة'; return;
+        }
         try {
-            const r = await sendWallets(keysStr);
+            // append بدلاً من replace — المحافظ السابقة لا تُحذف
+            const r = await (await fetch('/api/append-wallets', {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ keys: fileKeys, settings })
+            })).json();
+
             if (r && r.success) {
-                // keysStr مُنقّى بالفعل — نفس ما أُرسل للسيرفر
-                await saveKeys(keysStr); saveState(true);
+                // دمج المفاتيح المقبولة مع الموجودة في localStorage (لا استبدال)
+                const acceptedKeys = r.addedKeys || [];
+                if (acceptedKeys.length > 0) {
+                    const existingKeys = extractPrivateKeys(await loadKeys() || '');
+                    const existingSet  = new Set(existingKeys);
+                    const trulyNew     = acceptedKeys.filter(k => !existingSet.has(k));
+                    if (trulyNew.length > 0)
+                        await saveKeys([...existingKeys, ...trulyNew].join('\n'));
+                }
+                saveState(true);
                 document.getElementById('privateKeys').value = '';
-                if (r.loading) { startProgress(r.total); }
-                else { setUI(true); await loadNotifications(); }
+                setUI(true); await loadNotifications();
                 toast(r.message, 'success');
             } else if (r) { toast('خطأ: ' + r.message, 'error'); }
         } catch(err) { toast('خطأ في الاتصال: ' + err.message, 'error'); }

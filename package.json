@@ -1,21 +1,35 @@
 {
-  "name": "solana-wallet-monitor",
-  "version": "2.0.0",
-  "description": "مراقب محافظ Solana الموزّع مع دعم الـ Cluster و WebSocket",
+  "name": "pumpfun-telegram-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for Solana wallet token transfer, burn/close, and Pump.fun creator fee delegation",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "NODE_OPTIONS='--max-old-space-size=3072' node index.js",
-    "pm2": "pm2 start index.js --name solana-monitor --max-memory-restart 4G --node-args='--max-old-space-size=3072'"
+    "dev": "node --watch index.js"
   },
+  "keywords": [
+    "solana",
+    "telegram",
+    "grammy",
+    "pump-fun",
+    "spl-token",
+    "burn",
+    "delegate"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
-    "@solana/web3.js": "^1.98.0",
+    "@coral-xyz/anchor": "^0.30.1",
+    "@pump-fun/pump-sdk": "^1.20.0",
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.95.4",
+    "bn.js": "^5.2.1",
     "bs58": "^6.0.0",
-    "compression": "^1.7.4",
-    "dotenv": "^16.0.3",
-    "express": "^4.18.2"
+    "express": "^4.21.1",
+    "grammy": "^1.30.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.0.0 <23.0.0"
   }
 }

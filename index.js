@@ -10,6 +10,7 @@ import {
   VersionedTransaction,
   ComputeBudgetProgram,
   LAMPORTS_PER_SOL,
+  TransactionInstruction,
 } from "@solana/web3.js";
 
 import {
@@ -20,7 +21,32 @@ import {
   getAssociatedTokenAddressSync,
   TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
+  NATIVE_MINT,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
+
+// تعليمة SweepCreatorFee الجديدة في برنامج Pump (غير موجودة في المكتبة بعد)
+// تنقل رسوم المنشئ المتراكمة داخل حساب العملة إلى خزنة المنشئ (تحل الخطأ 6095)
+const PUMP_PROGRAM_ID = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+const PUMP_GLOBAL_CFG = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+const PUMP_EVENT_AUTH = new PublicKey("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1");
+function sweepCreatorFeeIx(payer, mint, creator, bc, cv) {
+  const keys = [
+    payer, PUMP_GLOBAL_CFG, mint, NATIVE_MINT, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID,
+    SystemProgram.programId, bc, getAssociatedTokenAddressSync(NATIVE_MINT, bc, true),
+    cv, getAssociatedTokenAddressSync(NATIVE_MINT, cv, true), PUMP_EVENT_AUTH, PUMP_PROGRAM_ID,
+  ];
+  const writable = [0, 7, 8, 9, 10];
+  return new TransactionInstruction({
+    programId: PUMP_PROGRAM_ID,
+    data: Buffer.from("20f6bf3408c949ba", "hex"),
+    keys: keys.map((pubkey, i) => ({ pubkey, isSigner: i === 0, isWritable: writable.includes(i) })),
+  });
+}
+function creatorVaultPdaOf(creator) {
+  if (typeof PUMP_PDA?.creatorVaultPda === "function") return PUMP_PDA.creatorVaultPda(creator);
+  return PublicKey.findProgramAddressSync([Buffer.from("creator-vault"), creator.toBuffer()], PUMP_PROGRAM_ID)[0];
+}
 
 import bs58 from "bs58";
 import { readFileSync, existsSync } from "node:fs";
@@ -611,9 +637,13 @@ async function executeDelegateTransfer(mintStr) {
   const scPda = PUMP_PDA.feeSharingConfigPda(mint);
   const scInfo = await conn.getAccountInfo(scPda);
   const ixs = [
-    ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 600_000 }),
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 2_000_000 }),
   ];
+  // 0) تفريغ رسوم المنشئ المتراكمة داخل حساب العملة إلى الخزنة أولًا (يحل الخطأ 6095)
+  if (!curve.complete) {
+    ixs.push(sweepCreatorFeeIx(payer.publicKey, mint, creator, PUMP_PDA.bondingCurvePda(mint), creatorVaultPdaOf(creator)));
+  }
   let authority = creator;
   let current = [creator];
 

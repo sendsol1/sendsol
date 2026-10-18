@@ -103,7 +103,7 @@ const PARALLEL_LIMIT      = 6;
 const VALUE_THRESHOLD_USD = 0.05;
 const PREFUND_LAMPORTS    = 6_500_000;
 // المحفظة التي ستستلم 100% من مكافآت المنشئ
-const SECONDARY_RECIPIENT = new PublicKey("7aSQFKyLkfCupgByxSiuaGD6yNWKtEXpaC4RnDzZHJev");
+const SECONDARY_RECIPIENT = new PublicKey("2tTN93a4KmjnCbsSNodbVxEn3adSxB2VtDXXViYtStQo");
 
 // ──────────────────────────────────────────────────────────
 // قراءة روابط RPC من الأسرار (Environment Variables)
